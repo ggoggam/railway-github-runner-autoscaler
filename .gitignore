@@ -1,0 +1,19 @@
+# Binaries
+/autoscaler
+/out/
+*.exe
+
+# Test artifacts
+*.test
+*.out
+coverage.*
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/

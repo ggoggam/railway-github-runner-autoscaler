@@ -1,0 +1,122 @@
+package main
+
+import (
+	"reflect"
+	"testing"
+	"time"
+)
+
+// setRequiredEnv sets the minimum viable configuration.
+func setRequiredEnv(t *testing.T) {
+	t.Helper()
+	t.Setenv("GITHUB_WEBHOOK_SECRET", "secret")
+	t.Setenv("RAILWAY_API_TOKEN", "token")
+	t.Setenv("RAILWAY_RUNNER_SERVICE_ID", "svc")
+	t.Setenv("RAILWAY_ENVIRONMENT_ID", "env")
+}
+
+func TestLoadConfigDefaults(t *testing.T) {
+	setRequiredEnv(t)
+
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if cfg.MaxRunners != defaultMaxRunners {
+		t.Errorf("MaxRunners = %d, want %d", cfg.MaxRunners, defaultMaxRunners)
+	}
+	if cfg.MinReplicas != defaultMinReplicas {
+		t.Errorf("MinReplicas = %d, want %d", cfg.MinReplicas, defaultMinReplicas)
+	}
+	if cfg.Port != defaultPort {
+		t.Errorf("Port = %q, want %q", cfg.Port, defaultPort)
+	}
+	if !reflect.DeepEqual(cfg.RunnerLabels, []string{"self-hosted", "railway"}) {
+		t.Errorf("RunnerLabels = %v", cfg.RunnerLabels)
+	}
+}
+
+func TestLoadConfigRequiresEachSecret(t *testing.T) {
+	for _, missing := range []string{
+		"GITHUB_WEBHOOK_SECRET",
+		"RAILWAY_API_TOKEN",
+		"RAILWAY_RUNNER_SERVICE_ID",
+		"RAILWAY_ENVIRONMENT_ID",
+	} {
+		t.Run(missing, func(t *testing.T) {
+			setRequiredEnv(t)
+			t.Setenv(missing, "")
+			if _, err := loadConfig(); err == nil {
+				t.Fatalf("want error when %s is unset", missing)
+			}
+		})
+	}
+}
+
+func TestLoadConfigOverrides(t *testing.T) {
+	setRequiredEnv(t)
+	t.Setenv("MAX_RUNNERS", "12")
+	t.Setenv("MIN_REPLICAS", "0")
+	t.Setenv("PORT", "9090")
+	t.Setenv("RUNNER_LABELS", " Railway , Self-Hosted ")
+	t.Setenv("IDLE_COOLDOWN", "90s")
+	t.Setenv("STARTUP_GRACE", "10m")
+	t.Setenv("JOB_TTL", "2h")
+	t.Setenv("RAILWAY_RUNNER_REGION", "us-west2")
+
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if cfg.MaxRunners != 12 || cfg.MinReplicas != 0 || cfg.Port != "9090" {
+		t.Errorf("scalar overrides not applied: %+v", cfg)
+	}
+	if !reflect.DeepEqual(cfg.RunnerLabels, []string{"railway", "self-hosted"}) {
+		t.Errorf("labels not normalized: %v", cfg.RunnerLabels)
+	}
+	if cfg.IdleCooldown != 90*time.Second || cfg.StartupGrace != 10*time.Minute || cfg.JobTTL != 2*time.Hour {
+		t.Errorf("durations not applied: %+v", cfg)
+	}
+	if cfg.Region != "us-west2" {
+		t.Errorf("Region = %q", cfg.Region)
+	}
+}
+
+func TestLoadConfigRejectsBadValues(t *testing.T) {
+	for name, env := range map[string]map[string]string{
+		"max runners zero":     {"MAX_RUNNERS": "0"},
+		"max runners negative": {"MAX_RUNNERS": "-1"},
+		"max runners garbage":  {"MAX_RUNNERS": "many"},
+		"min above max":        {"MIN_REPLICAS": "5", "MAX_RUNNERS": "2"},
+		"min negative":         {"MIN_REPLICAS": "-1"},
+		"bad duration":         {"IDLE_COOLDOWN": "soon"},
+		"zero resync":          {"RESYNC_PERIOD": "0s"},
+		"blank labels":         {"RUNNER_LABELS": " , , "},
+	} {
+		t.Run(name, func(t *testing.T) {
+			setRequiredEnv(t)
+			for k, v := range env {
+				t.Setenv(k, v)
+			}
+			if _, err := loadConfig(); err == nil {
+				t.Fatalf("want error for %s", name)
+			}
+		})
+	}
+}
+
+func TestNormalizeLabels(t *testing.T) {
+	for _, tc := range []struct {
+		in   string
+		want []string
+	}{
+		{"railway", []string{"railway"}},
+		{"A, B ,c", []string{"a", "b", "c"}},
+		{"a,,b", []string{"a", "b"}},
+		{"  ", nil},
+	} {
+		if got := normalizeLabels(tc.in); !reflect.DeepEqual(got, tc.want) {
+			t.Errorf("normalizeLabels(%q) = %v, want %v", tc.in, got, tc.want)
+		}
+	}
+}
