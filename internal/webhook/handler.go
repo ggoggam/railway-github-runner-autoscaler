@@ -1,4 +1,6 @@
-package main
+// Package webhook serves GitHub workflow_job events and the service's
+// observability endpoints.
+package webhook
 
 import (
 	"crypto/hmac"
@@ -10,6 +12,9 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+
+	"github.com/ggoggam/railway-github-runner-autoscaler/internal/bounded"
+	"github.com/ggoggam/railway-github-runner-autoscaler/internal/scaler"
 )
 
 const (
@@ -17,8 +22,24 @@ const (
 	trackedDeliveries = 4096
 )
 
-// WorkflowJobEvent is the slice of GitHub's workflow_job payload we care about.
-type WorkflowJobEvent struct {
+// Tracker consumes job lifecycle events and reports current state.
+type Tracker interface {
+	OnQueued(id int64)
+	OnInProgress(id int64)
+	OnCompleted(id int64)
+	Stats() scaler.Stats
+}
+
+// Options configures webhook handling.
+type Options struct {
+	// Secret is the shared secret GitHub signs payloads with.
+	Secret string
+	// Labels must all be present on a job for it to be counted.
+	Labels []string
+}
+
+// jobEvent is the slice of GitHub's workflow_job payload we care about.
+type jobEvent struct {
 	Action      string `json:"action"`
 	WorkflowJob struct {
 		ID     int64    `json:"id"`
@@ -28,23 +49,25 @@ type WorkflowJobEvent struct {
 
 // Handler serves the webhook and observability endpoints.
 type Handler struct {
-	cfg    Config
-	auto   *Autoscaler
-	logger *slog.Logger
+	opts    Options
+	tracker Tracker
+	logger  *slog.Logger
 
 	mu         sync.Mutex
-	deliveries *boundedSet[string]
+	deliveries *bounded.Set[string]
 }
 
-func NewHandler(cfg Config, auto *Autoscaler, logger *slog.Logger) *Handler {
+// New returns a Handler feeding events to tracker.
+func New(opts Options, tracker Tracker, logger *slog.Logger) *Handler {
 	return &Handler{
-		cfg:        cfg,
-		auto:       auto,
+		opts:       opts,
+		tracker:    tracker,
 		logger:     logger,
-		deliveries: newBoundedSet[string](trackedDeliveries),
+		deliveries: bounded.NewSet[string](trackedDeliveries),
 	}
 }
 
+// Routes returns the HTTP routes this handler serves.
 func (h *Handler) Routes() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /webhook", h.handleWebhook)
@@ -58,7 +81,7 @@ func (h *Handler) handleHealth(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (h *Handler) handleStatus(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, h.auto.Stats())
+	writeJSON(w, http.StatusOK, h.tracker.Stats())
 }
 
 func (h *Handler) handleWebhook(w http.ResponseWriter, r *http.Request) {
@@ -69,7 +92,7 @@ func (h *Handler) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !validateSignature(body, r.Header.Get("X-Hub-Signature-256"), h.cfg.WebhookSecret) {
+	if !ValidateSignature(body, r.Header.Get("X-Hub-Signature-256"), h.opts.Secret) {
 		h.logger.Warn("rejected webhook with invalid signature", "remote", r.RemoteAddr)
 		http.Error(w, "invalid signature", http.StatusUnauthorized)
 		return
@@ -98,26 +121,26 @@ func (h *Handler) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	var ev WorkflowJobEvent
+	var ev jobEvent
 	if err := json.Unmarshal(body, &ev); err != nil {
 		http.Error(w, "invalid JSON", http.StatusBadRequest)
 		return
 	}
 
-	if !matchesLabels(ev.WorkflowJob.Labels, h.cfg.RunnerLabels) {
+	if !MatchesLabels(ev.WorkflowJob.Labels, h.opts.Labels) {
 		h.logger.Debug("ignoring job for other runners",
-			"job", ev.WorkflowJob.ID, "labels", ev.WorkflowJob.Labels, "want", h.cfg.RunnerLabels)
+			"job", ev.WorkflowJob.ID, "labels", ev.WorkflowJob.Labels, "want", h.opts.Labels)
 		w.WriteHeader(http.StatusOK)
 		return
 	}
 
 	switch ev.Action {
 	case "queued":
-		h.auto.OnQueued(ev.WorkflowJob.ID)
+		h.tracker.OnQueued(ev.WorkflowJob.ID)
 	case "in_progress":
-		h.auto.OnInProgress(ev.WorkflowJob.ID)
+		h.tracker.OnInProgress(ev.WorkflowJob.ID)
 	case "completed":
-		h.auto.OnCompleted(ev.WorkflowJob.ID)
+		h.tracker.OnCompleted(ev.WorkflowJob.ID)
 	default:
 		h.logger.Debug("ignoring unhandled action", "action", ev.Action)
 	}
@@ -128,8 +151,8 @@ func (h *Handler) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
-// validateSignature verifies GitHub's HMAC-SHA256 body signature.
-func validateSignature(body []byte, sigHeader, secret string) bool {
+// ValidateSignature verifies GitHub's HMAC-SHA256 body signature.
+func ValidateSignature(body []byte, sigHeader, secret string) bool {
 	const prefix = "sha256="
 	if secret == "" || !strings.HasPrefix(sigHeader, prefix) {
 		return false
@@ -143,8 +166,8 @@ func validateSignature(body []byte, sigHeader, secret string) bool {
 	return hmac.Equal(mac.Sum(nil), provided)
 }
 
-// matchesLabels reports whether the job requests every configured runner label.
-func matchesLabels(jobLabels, required []string) bool {
+// MatchesLabels reports whether the job requests every configured runner label.
+func MatchesLabels(jobLabels, required []string) bool {
 	if len(required) == 0 {
 		return false
 	}

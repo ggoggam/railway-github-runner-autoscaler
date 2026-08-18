@@ -1,4 +1,6 @@
-package main
+// Package railway is a small client for the parts of Railway's public GraphQL
+// API needed to read and set a service's replica count.
+package railway
 
 import (
 	"bytes"
@@ -15,10 +17,10 @@ import (
 	"time"
 )
 
-// DefaultRailwayEndpoint is Railway's public GraphQL API.
+// DefaultEndpoint is Railway's public GraphQL API.
 //
 // Note the .com host: the older backboard.railway.app address is legacy.
-const DefaultRailwayEndpoint = "https://backboard.railway.com/graphql/v2"
+const DefaultEndpoint = "https://backboard.railway.com/graphql/v2"
 
 const (
 	maxAttempts     = 4
@@ -27,22 +29,20 @@ const (
 	maxRespBodyRead = 1 << 20 // 1MiB
 )
 
-type gqlRequest struct {
+type request struct {
 	Query     string         `json:"query"`
 	Variables map[string]any `json:"variables,omitempty"`
 }
 
-type gqlError struct {
-	Message string `json:"message"`
-}
-
-type gqlResponse struct {
+type response struct {
 	Data   json.RawMessage `json:"data"`
-	Errors []gqlError      `json:"errors"`
+	Errors []struct {
+		Message string `json:"message"`
+	} `json:"errors"`
 }
 
-// RailwayClient talks to Railway's public GraphQL API.
-type RailwayClient struct {
+// Client talks to Railway's public GraphQL API.
+type Client struct {
 	Token    string
 	Endpoint string
 	HTTP     *http.Client
@@ -52,10 +52,11 @@ type RailwayClient struct {
 	Sleep func(context.Context, time.Duration) error
 }
 
-func NewRailwayClient(token string, logger *slog.Logger) *RailwayClient {
-	return &RailwayClient{
+// NewClient returns a Client pointed at Railway's public API.
+func NewClient(token string, logger *slog.Logger) *Client {
+	return &Client{
 		Token:    token,
-		Endpoint: DefaultRailwayEndpoint,
+		Endpoint: DefaultEndpoint,
 		HTTP:     &http.Client{Timeout: 30 * time.Second},
 		Logger:   logger,
 		Sleep:    sleepCtx,
@@ -73,25 +74,25 @@ func sleepCtx(ctx context.Context, d time.Duration) error {
 	}
 }
 
-// retryableError marks a failure worth another attempt.
-type retryableError struct {
+// retryable marks a failure worth another attempt.
+type retryable struct {
 	err   error
 	after time.Duration // server-provided delay, if any
 }
 
-func (e *retryableError) Error() string { return e.err.Error() }
-func (e *retryableError) Unwrap() error { return e.err }
+func (e *retryable) Error() string { return e.err.Error() }
+func (e *retryable) Unwrap() error { return e.err }
 
-// Do executes a GraphQL document, retrying transient failures.
+// do executes a GraphQL document, retrying transient failures.
 //
 // Every mutation this client issues is idempotent (it sets an absolute replica
 // count rather than applying a delta), so retrying is safe.
-func (c *RailwayClient) Do(ctx context.Context, req gqlRequest, out any) error {
+func (c *Client) do(ctx context.Context, req request, out any) error {
 	var lastErr error
 	for attempt := range maxAttempts {
 		if attempt > 0 {
 			delay := backoffFor(attempt)
-			var re *retryableError
+			var re *retryable
 			if errors.As(lastErr, &re) && re.after > 0 {
 				delay = re.after
 			}
@@ -108,7 +109,7 @@ func (c *RailwayClient) Do(ctx context.Context, req gqlRequest, out any) error {
 		}
 		lastErr = err
 
-		var re *retryableError
+		var re *retryable
 		if !errors.As(err, &re) {
 			return err // permanent; do not burn attempts
 		}
@@ -124,7 +125,7 @@ func backoffFor(attempt int) time.Duration {
 	return min(d, maxBackoff)
 }
 
-func (c *RailwayClient) attempt(ctx context.Context, req gqlRequest, out any) error {
+func (c *Client) attempt(ctx context.Context, req request, out any) error {
 	body, err := json.Marshal(req)
 	if err != nil {
 		return fmt.Errorf("marshal request: %w", err)
@@ -140,41 +141,41 @@ func (c *RailwayClient) attempt(ctx context.Context, req gqlRequest, out any) er
 	resp, err := c.HTTP.Do(httpReq)
 	if err != nil {
 		// Transport-level failures are worth another go.
-		return &retryableError{err: fmt.Errorf("railway api transport: %w", err)}
+		return &retryable{err: fmt.Errorf("railway api transport: %w", err)}
 	}
 	defer resp.Body.Close()
 
 	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxRespBodyRead))
 	if err != nil {
-		return &retryableError{err: fmt.Errorf("read response: %w", err)}
+		return &retryable{err: fmt.Errorf("read response: %w", err)}
 	}
 
 	switch {
 	case resp.StatusCode == http.StatusTooManyRequests:
-		return &retryableError{
+		return &retryable{
 			err:   fmt.Errorf("railway api rate limited (429): %s", truncate(respBody, 200)),
 			after: retryAfter(resp.Header.Get("Retry-After")),
 		}
 	case resp.StatusCode >= 500:
-		return &retryableError{err: fmt.Errorf("railway api %d: %s", resp.StatusCode, truncate(respBody, 200))}
+		return &retryable{err: fmt.Errorf("railway api %d: %s", resp.StatusCode, truncate(respBody, 200))}
 	case resp.StatusCode == http.StatusUnauthorized, resp.StatusCode == http.StatusForbidden:
 		return fmt.Errorf("railway api %d (check RAILWAY_API_TOKEN): %s", resp.StatusCode, truncate(respBody, 200))
 	case resp.StatusCode != http.StatusOK:
 		return fmt.Errorf("railway api %d: %s", resp.StatusCode, truncate(respBody, 200))
 	}
 
-	var gqlResp gqlResponse
-	if err := json.Unmarshal(respBody, &gqlResp); err != nil {
-		return &retryableError{err: fmt.Errorf("unmarshal response: %w", err)}
+	var parsed response
+	if err := json.Unmarshal(respBody, &parsed); err != nil {
+		return &retryable{err: fmt.Errorf("unmarshal response: %w", err)}
 	}
-	if len(gqlResp.Errors) > 0 {
+	if len(parsed.Errors) > 0 {
 		// Railway surfaces transient internal faults as a 200 with an errors
 		// array (e.g. "Problem processing request"), so these retry too.
-		return &retryableError{err: fmt.Errorf("railway graphql: %s", gqlResp.Errors[0].Message)}
+		return &retryable{err: fmt.Errorf("railway graphql: %s", parsed.Errors[0].Message)}
 	}
 
-	if out != nil && gqlResp.Data != nil {
-		if err := json.Unmarshal(gqlResp.Data, out); err != nil {
+	if out != nil && parsed.Data != nil {
+		if err := json.Unmarshal(parsed.Data, out); err != nil {
 			return fmt.Errorf("unmarshal data: %w", err)
 		}
 	}
@@ -203,6 +204,15 @@ func truncate(b []byte, n int) string {
 	return string(b[:n]) + "…"
 }
 
+// ServiceState is what a runner service looks like right now.
+type ServiceState struct {
+	// Regions the service deploys to. Empty means the region could not be
+	// determined and the legacy numReplicas field should be used.
+	Regions []string
+	// Replicas currently configured, summed across regions. -1 when unknown.
+	Replicas int
+}
+
 const discoverQuery = `
 query RunnerServiceInstance($serviceId: String!, $environmentId: String!) {
   serviceInstance(serviceId: $serviceId, environmentId: $environmentId) {
@@ -212,21 +222,12 @@ query RunnerServiceInstance($serviceId: String!, $environmentId: String!) {
   }
 }`
 
-// ServiceState is what the runner service looks like right now.
-type ServiceState struct {
-	// Regions the service deploys to. Empty means the region could not be
-	// determined and the legacy numReplicas field should be used.
-	Regions []string
-	// Replicas currently configured, summed across regions. -1 when unknown.
-	Replicas int
-}
-
-// DiscoverServiceState reads the runner service's current regions and replica count.
+// DiscoverServiceState reads a service's current regions and replica count.
 //
 // Railway keys replica counts by region under multiRegionConfig; that map is not
 // exposed as a readable field, so it is read back out of the latest deployment's
 // service manifest.
-func (c *RailwayClient) DiscoverServiceState(ctx context.Context, serviceID, envID string) (ServiceState, error) {
+func (c *Client) DiscoverServiceState(ctx context.Context, serviceID, envID string) (ServiceState, error) {
 	var out struct {
 		ServiceInstance struct {
 			Region           *string `json:"region"`
@@ -246,7 +247,7 @@ func (c *RailwayClient) DiscoverServiceState(ctx context.Context, serviceID, env
 	}
 
 	state := ServiceState{Replicas: -1}
-	if err := c.Do(ctx, gqlRequest{
+	if err := c.do(ctx, request{
 		Query:     discoverQuery,
 		Variables: map[string]any{"serviceId": serviceID, "environmentId": envID},
 	}, &out); err != nil {
@@ -282,12 +283,12 @@ mutation UpdateReplicas($serviceId: String!, $environmentId: String!, $input: Se
   serviceInstanceUpdate(serviceId: $serviceId, environmentId: $environmentId, input: $input)
 }`
 
-// SetReplicas sets the runner service to exactly n replicas.
+// SetReplicas sets a service to exactly n replicas.
 //
 // When regions are known the count is written as multiRegionConfig, which is how
 // current Railway represents horizontal scaling. Bare numReplicas is the legacy
 // path and is only used when no region could be determined.
-func (c *RailwayClient) SetReplicas(ctx context.Context, serviceID, envID string, regions []string, n int) error {
+func (c *Client) SetReplicas(ctx context.Context, serviceID, envID string, regions []string, n int) error {
 	input := map[string]any{}
 	if len(regions) > 0 {
 		mrc := make(map[string]any, len(regions))
@@ -299,7 +300,7 @@ func (c *RailwayClient) SetReplicas(ctx context.Context, serviceID, envID string
 		input["numReplicas"] = n
 	}
 
-	return c.Do(ctx, gqlRequest{
+	return c.do(ctx, request{
 		Query: setReplicasMutation,
 		Variables: map[string]any{
 			"serviceId":     serviceID,

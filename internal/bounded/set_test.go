@@ -1,9 +1,9 @@
-package main
+package bounded
 
 import "testing"
 
-func TestBoundedSetAddReportsDuplicates(t *testing.T) {
-	s := newBoundedSet[string](4)
+func TestAddReportsDuplicates(t *testing.T) {
+	s := NewSet[string](4)
 
 	if s.Add("a") {
 		t.Fatal("first Add should report not-present")
@@ -16,8 +16,8 @@ func TestBoundedSetAddReportsDuplicates(t *testing.T) {
 	}
 }
 
-func TestBoundedSetEvictsOldest(t *testing.T) {
-	s := newBoundedSet[int](3)
+func TestEvictsOldest(t *testing.T) {
+	s := NewSet[int](3)
 	for i := range 5 {
 		s.Add(i)
 	}
@@ -37,8 +37,8 @@ func TestBoundedSetEvictsOldest(t *testing.T) {
 	}
 }
 
-func TestBoundedSetMinimumSize(t *testing.T) {
-	s := newBoundedSet[int](0)
+func TestMinimumSize(t *testing.T) {
+	s := NewSet[int](0)
 	s.Add(1)
 	if !s.Has(1) {
 		t.Fatal("size <1 should be coerced to 1, not zero capacity")

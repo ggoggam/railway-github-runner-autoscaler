@@ -1,9 +1,10 @@
-package main
+package railway
 
 import (
 	"context"
 	"encoding/json"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -12,9 +13,9 @@ import (
 	"time"
 )
 
-func newTestClient(t *testing.T, url string) *RailwayClient {
+func newTestClient(t *testing.T, url string) *Client {
 	t.Helper()
-	c := NewRailwayClient("token", discardLogger())
+	c := NewClient("token", slog.New(slog.NewTextHandler(io.Discard, nil)))
 	c.Endpoint = url
 	c.Sleep = func(context.Context, time.Duration) error { return nil } // no real backoff
 	return c
@@ -244,7 +245,7 @@ func TestRetryAfterParsing(t *testing.T) {
 func TestDefaultEndpointIsRailwayDotCom(t *testing.T) {
 	// backboard.railway.app is the legacy host.
 	want := "https://backboard.railway.com/graphql/v2"
-	if DefaultRailwayEndpoint != want {
-		t.Fatalf("want %s, got %s", want, DefaultRailwayEndpoint)
+	if DefaultEndpoint != want {
+		t.Fatalf("want %s, got %s", want, DefaultEndpoint)
 	}
 }

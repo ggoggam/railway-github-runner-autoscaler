@@ -1,9 +1,11 @@
-package main
+package config
 
 import (
 	"reflect"
 	"testing"
 	"time"
+
+	"github.com/ggoggam/railway-github-runner-autoscaler/internal/railway"
 )
 
 // setRequiredEnv sets the minimum viable configuration.
@@ -15,28 +17,31 @@ func setRequiredEnv(t *testing.T) {
 	t.Setenv("RAILWAY_ENVIRONMENT_ID", "env")
 }
 
-func TestLoadConfigDefaults(t *testing.T) {
+func TestLoadDefaults(t *testing.T) {
 	setRequiredEnv(t)
 
-	cfg, err := loadConfig()
+	cfg, err := Load()
 	if err != nil {
-		t.Fatalf("loadConfig: %v", err)
+		t.Fatalf("Load: %v", err)
 	}
-	if cfg.MaxRunners != defaultMaxRunners {
-		t.Errorf("MaxRunners = %d, want %d", cfg.MaxRunners, defaultMaxRunners)
+	if cfg.MaxRunners != DefaultMaxRunners {
+		t.Errorf("MaxRunners = %d, want %d", cfg.MaxRunners, DefaultMaxRunners)
 	}
-	if cfg.MinReplicas != defaultMinReplicas {
-		t.Errorf("MinReplicas = %d, want %d", cfg.MinReplicas, defaultMinReplicas)
+	if cfg.MinReplicas != DefaultMinReplicas {
+		t.Errorf("MinReplicas = %d, want %d", cfg.MinReplicas, DefaultMinReplicas)
 	}
-	if cfg.Port != defaultPort {
-		t.Errorf("Port = %q, want %q", cfg.Port, defaultPort)
+	if cfg.Port != DefaultPort {
+		t.Errorf("Port = %q, want %q", cfg.Port, DefaultPort)
+	}
+	if cfg.APIEndpoint != railway.DefaultEndpoint {
+		t.Errorf("APIEndpoint = %q, want %q", cfg.APIEndpoint, railway.DefaultEndpoint)
 	}
 	if !reflect.DeepEqual(cfg.RunnerLabels, []string{"self-hosted", "railway"}) {
 		t.Errorf("RunnerLabels = %v", cfg.RunnerLabels)
 	}
 }
 
-func TestLoadConfigRequiresEachSecret(t *testing.T) {
+func TestLoadRequiresEachSecret(t *testing.T) {
 	for _, missing := range []string{
 		"GITHUB_WEBHOOK_SECRET",
 		"RAILWAY_API_TOKEN",
@@ -46,14 +51,14 @@ func TestLoadConfigRequiresEachSecret(t *testing.T) {
 		t.Run(missing, func(t *testing.T) {
 			setRequiredEnv(t)
 			t.Setenv(missing, "")
-			if _, err := loadConfig(); err == nil {
+			if _, err := Load(); err == nil {
 				t.Fatalf("want error when %s is unset", missing)
 			}
 		})
 	}
 }
 
-func TestLoadConfigOverrides(t *testing.T) {
+func TestLoadOverrides(t *testing.T) {
 	setRequiredEnv(t)
 	t.Setenv("MAX_RUNNERS", "12")
 	t.Setenv("MIN_REPLICAS", "0")
@@ -63,10 +68,11 @@ func TestLoadConfigOverrides(t *testing.T) {
 	t.Setenv("STARTUP_GRACE", "10m")
 	t.Setenv("JOB_TTL", "2h")
 	t.Setenv("RAILWAY_RUNNER_REGION", "us-west2")
+	t.Setenv("RAILWAY_API_URL", "http://localhost:9999/graphql/v2")
 
-	cfg, err := loadConfig()
+	cfg, err := Load()
 	if err != nil {
-		t.Fatalf("loadConfig: %v", err)
+		t.Fatalf("Load: %v", err)
 	}
 	if cfg.MaxRunners != 12 || cfg.MinReplicas != 0 || cfg.Port != "9090" {
 		t.Errorf("scalar overrides not applied: %+v", cfg)
@@ -80,9 +86,12 @@ func TestLoadConfigOverrides(t *testing.T) {
 	if cfg.Region != "us-west2" {
 		t.Errorf("Region = %q", cfg.Region)
 	}
+	if cfg.APIEndpoint != "http://localhost:9999/graphql/v2" {
+		t.Errorf("APIEndpoint = %q", cfg.APIEndpoint)
+	}
 }
 
-func TestLoadConfigRejectsBadValues(t *testing.T) {
+func TestLoadRejectsBadValues(t *testing.T) {
 	for name, env := range map[string]map[string]string{
 		"max runners zero":     {"MAX_RUNNERS": "0"},
 		"max runners negative": {"MAX_RUNNERS": "-1"},
@@ -98,10 +107,32 @@ func TestLoadConfigRejectsBadValues(t *testing.T) {
 			for k, v := range env {
 				t.Setenv(k, v)
 			}
-			if _, err := loadConfig(); err == nil {
+			if _, err := Load(); err == nil {
 				t.Fatalf("want error for %s", name)
 			}
 		})
+	}
+}
+
+func TestProjectionsCarryValues(t *testing.T) {
+	setRequiredEnv(t)
+	t.Setenv("MAX_RUNNERS", "7")
+	t.Setenv("MIN_REPLICAS", "2")
+	t.Setenv("IDLE_COOLDOWN", "45s")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	so := cfg.ScalerOptions()
+	if so.MaxRunners != 7 || so.MinReplicas != 2 || so.IdleCooldown != 45*time.Second {
+		t.Errorf("ScalerOptions lost values: %+v", so)
+	}
+
+	wo := cfg.WebhookOptions()
+	if wo.Secret != "secret" || !reflect.DeepEqual(wo.Labels, cfg.RunnerLabels) {
+		t.Errorf("WebhookOptions lost values: %+v", wo)
 	}
 }
 
@@ -115,8 +146,8 @@ func TestNormalizeLabels(t *testing.T) {
 		{"a,,b", []string{"a", "b"}},
 		{"  ", nil},
 	} {
-		if got := normalizeLabels(tc.in); !reflect.DeepEqual(got, tc.want) {
-			t.Errorf("normalizeLabels(%q) = %v, want %v", tc.in, got, tc.want)
+		if got := NormalizeLabels(tc.in); !reflect.DeepEqual(got, tc.want) {
+			t.Errorf("NormalizeLabels(%q) = %v, want %v", tc.in, got, tc.want)
 		}
 	}
 }

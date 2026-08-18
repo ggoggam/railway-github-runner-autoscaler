@@ -1,14 +1,18 @@
-package main
+// Package scaler tracks GitHub job state and drives a runner service's replica
+// count towards it.
+package scaler
 
 import (
 	"context"
 	"log/slog"
 	"sync"
 	"time"
+
+	"github.com/ggoggam/railway-github-runner-autoscaler/internal/bounded"
 )
 
-// Scaler applies an absolute replica count to the runner service.
-type Scaler interface {
+// Backend applies an absolute replica count to the runner service.
+type Backend interface {
 	SetReplicas(ctx context.Context, n int) error
 }
 
@@ -16,22 +20,37 @@ type Scaler interface {
 // out-of-order webhook delivery.
 const trackedJobs = 4096
 
-// Autoscaler tracks GitHub job state and drives the runner service's replica
-// count towards it.
+// Options tunes scaling behaviour.
+type Options struct {
+	// MinReplicas is the floor held while idle. Zero scales to zero.
+	MinReplicas int
+	// MaxRunners is the ceiling on concurrent replicas.
+	MaxRunners int
+	// IdleCooldown is the quiet period required before shrinking the pool.
+	IdleCooldown time.Duration
+	// StartupGrace holds existing replicas after a restart, before any shrink.
+	StartupGrace time.Duration
+	// JobTTL forgets jobs whose completion webhook never arrived.
+	JobTTL time.Duration
+	// ResyncPeriod is how often to retry failed scales and expire stale jobs.
+	ResyncPeriod time.Duration
+}
+
+// Autoscaler tracks jobs and reconciles the replica count.
 //
-// All Railway mutations happen on a single goroutine in Run. Webhook handlers
-// only mutate in-memory counters and poke a trigger channel, so concurrent
+// All Backend calls happen on a single goroutine in Run. Event methods only
+// mutate in-memory counters and poke a trigger channel, so concurrent webhook
 // deliveries can never interleave a read-modify-write against the API.
 type Autoscaler struct {
-	cfg    Config
-	scaler Scaler
-	logger *slog.Logger
-	now    func() time.Time
+	opts    Options
+	backend Backend
+	logger  *slog.Logger
+	now     func() time.Time
 
 	mu         sync.Mutex
 	queued     map[int64]time.Time
 	inProgress map[int64]time.Time
-	done       *boundedSet[int64]
+	done       *bounded.Set[int64]
 	lastBusy   time.Time
 	startedAt  time.Time
 	applied    int // replica count last applied; -1 when unknown
@@ -39,15 +58,16 @@ type Autoscaler struct {
 	trigger chan struct{}
 }
 
-func NewAutoscaler(cfg Config, scaler Scaler, logger *slog.Logger) *Autoscaler {
+// New returns an Autoscaler that drives backend towards observed job demand.
+func New(opts Options, backend Backend, logger *slog.Logger) *Autoscaler {
 	a := &Autoscaler{
-		cfg:        cfg,
-		scaler:     scaler,
+		opts:       opts,
+		backend:    backend,
 		logger:     logger,
 		now:        time.Now,
 		queued:     make(map[int64]time.Time),
 		inProgress: make(map[int64]time.Time),
-		done:       newBoundedSet[int64](trackedJobs),
+		done:       bounded.NewSet[int64](trackedJobs),
 		applied:    -1,
 		trigger:    make(chan struct{}, 1),
 	}
@@ -60,7 +80,7 @@ func NewAutoscaler(cfg Config, scaler Scaler, logger *slog.Logger) *Autoscaler {
 // started autoscaler knows what it is starting from rather than guessing.
 //
 // State lives in memory, so a restart forgets which jobs were running. The
-// startup grace in decide() keeps the existing replicas alive long enough for
+// startup grace in decide keeps the existing replicas alive long enough for
 // those jobs to finish or to re-announce themselves via webhooks.
 func (a *Autoscaler) SetBaseline(n int) {
 	a.mu.Lock()
@@ -127,9 +147,9 @@ func (a *Autoscaler) poke() {
 }
 
 // Run drives reconciliation until ctx is cancelled. It is the only goroutine
-// permitted to call the Scaler.
+// permitted to call the Backend.
 func (a *Autoscaler) Run(ctx context.Context) {
-	ticker := time.NewTicker(a.cfg.ResyncPeriod)
+	ticker := time.NewTicker(a.opts.ResyncPeriod)
 	defer ticker.Stop()
 
 	for {
@@ -149,9 +169,8 @@ type decision struct {
 	desired    int
 	queued     int
 	inProgress int
-	// heldDown is set when a scale-down was deliberately deferred, either
-	// because jobs are still running or because the idle cooldown has not
-	// elapsed. The resync ticker will re-evaluate.
+	// heldDown is set when a scale-down was deliberately deferred. The resync
+	// ticker will re-evaluate.
 	heldDown bool
 	reason   string
 }
@@ -161,7 +180,7 @@ func (a *Autoscaler) decide() decision {
 	defer a.mu.Unlock()
 
 	q, ip := len(a.queued), len(a.inProgress)
-	want := clamp(q+ip, a.cfg.MinReplicas, a.cfg.MaxRunners)
+	want := clamp(q+ip, a.opts.MinReplicas, a.opts.MaxRunners)
 	d := decision{desired: want, queued: q, inProgress: ip}
 
 	// Scaling down is the dangerous direction: Railway picks which replica to
@@ -171,11 +190,11 @@ func (a *Autoscaler) decide() decision {
 		switch {
 		case ip > 0:
 			d.desired, d.heldDown, d.reason = a.applied, true, "jobs still in progress"
-		case now.Sub(a.lastBusy) < a.cfg.IdleCooldown:
+		case now.Sub(a.lastBusy) < a.opts.IdleCooldown:
 			// Absorbs webhook lag: a job can be picked up by a runner before
 			// its in_progress event arrives.
 			d.desired, d.heldDown, d.reason = a.applied, true, "idle cooldown not elapsed"
-		case now.Sub(a.startedAt) < a.cfg.StartupGrace:
+		case now.Sub(a.startedAt) < a.opts.StartupGrace:
 			// Just booted, so an empty job map means "we have not heard yet",
 			// not "nothing is running". Shrinking now could kill live jobs.
 			d.desired, d.heldDown, d.reason = a.applied, true, "startup grace not elapsed"
@@ -202,8 +221,8 @@ func (a *Autoscaler) reconcile(ctx context.Context) {
 		return
 	}
 
-	if err := a.scaler.SetReplicas(ctx, d.desired); err != nil {
-		// Leave a.applied untouched so the next tick retries.
+	if err := a.backend.SetReplicas(ctx, d.desired); err != nil {
+		// Leave applied untouched so the next tick retries.
 		a.logger.Error("set replicas failed",
 			"desired", d.desired, "current", applied, "err", err)
 		return
@@ -224,10 +243,10 @@ func (a *Autoscaler) reconcile(ctx context.Context) {
 // gc drops jobs whose terminal webhook never arrived. Without it a single lost
 // "completed" delivery would pin the replica count up forever.
 func (a *Autoscaler) gc() {
-	if a.cfg.JobTTL <= 0 {
+	if a.opts.JobTTL <= 0 {
 		return
 	}
-	cutoff := a.now().Add(-a.cfg.JobTTL)
+	cutoff := a.now().Add(-a.opts.JobTTL)
 
 	a.mu.Lock()
 	var expired []int64
@@ -247,30 +266,31 @@ func (a *Autoscaler) gc() {
 
 	if len(expired) > 0 {
 		a.logger.Warn("expired stale jobs (missing completion webhook?)",
-			"jobs", expired, "ttl", a.cfg.JobTTL)
+			"jobs", expired, "ttl", a.opts.JobTTL)
 	}
 }
 
-// Stats is a point-in-time snapshot for the /status endpoint.
+// Stats is a point-in-time snapshot, served by the /status endpoint.
 type Stats struct {
-	Queued     int    `json:"queued"`
-	InProgress int    `json:"inProgress"`
-	Replicas   int    `json:"replicas"`
-	MinRepl    int    `json:"minReplicas"`
-	MaxRunners int    `json:"maxRunners"`
-	LastBusy   string `json:"lastBusy"`
+	Queued      int    `json:"queued"`
+	InProgress  int    `json:"inProgress"`
+	Replicas    int    `json:"replicas"`
+	MinReplicas int    `json:"minReplicas"`
+	MaxRunners  int    `json:"maxRunners"`
+	LastBusy    string `json:"lastBusy"`
 }
 
+// Stats returns the current job counts and replica state.
 func (a *Autoscaler) Stats() Stats {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return Stats{
-		Queued:     len(a.queued),
-		InProgress: len(a.inProgress),
-		Replicas:   a.applied,
-		MinRepl:    a.cfg.MinReplicas,
-		MaxRunners: a.cfg.MaxRunners,
-		LastBusy:   a.lastBusy.UTC().Format(time.RFC3339),
+		Queued:      len(a.queued),
+		InProgress:  len(a.inProgress),
+		Replicas:    a.applied,
+		MinReplicas: a.opts.MinReplicas,
+		MaxRunners:  a.opts.MaxRunners,
+		LastBusy:    a.lastBusy.UTC().Format(time.RFC3339),
 	}
 }
 

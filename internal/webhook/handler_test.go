@@ -1,17 +1,60 @@
-package main
+package webhook
 
 import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
+
+	"github.com/ggoggam/railway-github-runner-autoscaler/internal/scaler"
 )
 
 const testSecret = "s3cr3t"
+
+// fakeTracker records the events the handler forwards.
+type fakeTracker struct {
+	mu         sync.Mutex
+	queued     []int64
+	inProgress []int64
+	completed  []int64
+}
+
+func (f *fakeTracker) OnQueued(id int64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.queued = append(f.queued, id)
+}
+
+func (f *fakeTracker) OnInProgress(id int64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.inProgress = append(f.inProgress, id)
+}
+
+func (f *fakeTracker) OnCompleted(id int64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.completed = append(f.completed, id)
+}
+
+func (f *fakeTracker) Stats() scaler.Stats {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return scaler.Stats{Queued: len(f.queued), InProgress: len(f.inProgress)}
+}
+
+func (f *fakeTracker) queuedCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.queued)
+}
 
 func sign(body string) string {
 	mac := hmac.New(sha256.New, []byte(testSecret))
@@ -28,12 +71,15 @@ func jobPayload(action string, id int64, labels ...string) string {
 		action, id, strings.Join(quoted, ","))
 }
 
-func newTestHandler(t *testing.T) (*Handler, *Autoscaler) {
+func newTestHandler(t *testing.T) (*Handler, *fakeTracker) {
 	t.Helper()
-	cfg := testConfig()
-	cfg.WebhookSecret = testSecret
-	a, _, _ := newTestAutoscaler(t, cfg, 1)
-	return NewHandler(cfg, a, discardLogger()), a
+	tr := &fakeTracker{}
+	h := New(
+		Options{Secret: testSecret, Labels: []string{"railway"}},
+		tr,
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+	)
+	return h, tr
 }
 
 func post(h *Handler, body string, headers map[string]string) *httptest.ResponseRecorder {
@@ -47,7 +93,7 @@ func post(h *Handler, body string, headers map[string]string) *httptest.Response
 }
 
 func TestRejectsInvalidSignature(t *testing.T) {
-	h, a := newTestHandler(t)
+	h, tr := newTestHandler(t)
 	body := jobPayload("queued", 1, "railway")
 
 	for name, sig := range map[string]string{
@@ -67,13 +113,13 @@ func TestRejectsInvalidSignature(t *testing.T) {
 		})
 	}
 
-	if s := a.Stats(); s.Queued != 0 {
-		t.Fatalf("unsigned request mutated state: %+v", s)
+	if tr.queuedCount() != 0 {
+		t.Fatal("unsigned request reached the tracker")
 	}
 }
 
-func TestAcceptsValidSignatureAndTracksJob(t *testing.T) {
-	h, a := newTestHandler(t)
+func TestAcceptsValidSignatureAndForwardsJob(t *testing.T) {
+	h, tr := newTestHandler(t)
 	body := jobPayload("queued", 42, "railway")
 
 	rr := post(h, body, map[string]string{
@@ -84,14 +130,33 @@ func TestAcceptsValidSignatureAndTracksJob(t *testing.T) {
 	if rr.Code != http.StatusOK {
 		t.Fatalf("want 200, got %d", rr.Code)
 	}
-	if s := a.Stats(); s.Queued != 1 {
-		t.Fatalf("want 1 queued job, got %+v", s)
+	if tr.queuedCount() != 1 {
+		t.Fatalf("want 1 queued job, got %d", tr.queuedCount())
+	}
+}
+
+func TestForwardsEachAction(t *testing.T) {
+	h, tr := newTestHandler(t)
+	for i, action := range []string{"queued", "in_progress", "completed"} {
+		body := jobPayload(action, int64(i), "railway")
+		post(h, body, map[string]string{
+			"X-GitHub-Event":      "workflow_job",
+			"X-Hub-Signature-256": sign(body),
+			"X-GitHub-Delivery":   action,
+		})
+	}
+
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+	if len(tr.queued) != 1 || len(tr.inProgress) != 1 || len(tr.completed) != 1 {
+		t.Fatalf("actions not routed: queued=%v inProgress=%v completed=%v",
+			tr.queued, tr.inProgress, tr.completed)
 	}
 }
 
 // GitHub retries deliveries; replaying one must not double-count.
 func TestDuplicateDeliveryIgnored(t *testing.T) {
-	h, a := newTestHandler(t)
+	h, tr := newTestHandler(t)
 	body := jobPayload("queued", 7, "railway")
 	headers := map[string]string{
 		"X-GitHub-Event":      "workflow_job",
@@ -102,13 +167,13 @@ func TestDuplicateDeliveryIgnored(t *testing.T) {
 	post(h, body, headers)
 	post(h, body, headers)
 
-	if s := a.Stats(); s.Queued != 1 {
-		t.Fatalf("duplicate delivery double-counted: %+v", s)
+	if tr.queuedCount() != 1 {
+		t.Fatalf("duplicate delivery double-counted: %d", tr.queuedCount())
 	}
 }
 
 func TestIgnoresJobsForOtherRunners(t *testing.T) {
-	h, a := newTestHandler(t)
+	h, tr := newTestHandler(t)
 	body := jobPayload("queued", 9, "ubuntu-latest")
 
 	rr := post(h, body, map[string]string{
@@ -118,8 +183,8 @@ func TestIgnoresJobsForOtherRunners(t *testing.T) {
 	if rr.Code != http.StatusOK {
 		t.Fatalf("want 200, got %d", rr.Code)
 	}
-	if s := a.Stats(); s.Queued != 0 {
-		t.Fatalf("tracked a job meant for another runner: %+v", s)
+	if tr.queuedCount() != 0 {
+		t.Fatal("tracked a job meant for another runner")
 	}
 }
 
@@ -175,8 +240,8 @@ func TestMatchesLabels(t *testing.T) {
 		{"whitespace padded", []string{" railway "}, []string{"railway"}, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := matchesLabels(tc.job, tc.required); got != tc.want {
-				t.Fatalf("matchesLabels(%v, %v) = %v, want %v", tc.job, tc.required, got, tc.want)
+			if got := MatchesLabels(tc.job, tc.required); got != tc.want {
+				t.Fatalf("MatchesLabels(%v, %v) = %v, want %v", tc.job, tc.required, got, tc.want)
 			}
 		})
 	}
@@ -188,7 +253,7 @@ func TestValidateSignatureRejectsEmptySecret(t *testing.T) {
 	mac.Write(body)
 	sig := "sha256=" + hex.EncodeToString(mac.Sum(nil))
 
-	if validateSignature(body, sig, "") {
+	if ValidateSignature(body, sig, "") {
 		t.Fatal("an empty secret must never validate")
 	}
 }

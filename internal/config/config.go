@@ -1,4 +1,5 @@
-package main
+// Package config loads and validates the autoscaler's environment configuration.
+package config
 
 import (
 	"fmt"
@@ -6,6 +7,10 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/ggoggam/railway-github-runner-autoscaler/internal/railway"
+	"github.com/ggoggam/railway-github-runner-autoscaler/internal/scaler"
+	"github.com/ggoggam/railway-github-runner-autoscaler/internal/webhook"
 )
 
 // Config holds every tunable the autoscaler reads from the environment.
@@ -33,26 +38,29 @@ type Config struct {
 	Port string
 }
 
+// Defaults applied when the corresponding variable is unset.
 const (
-	defaultMaxRunners   = 3
-	defaultMinReplicas  = 1
-	defaultPort         = "8080"
-	defaultRunnerLabels = "self-hosted,railway"
-	defaultIdleCooldown = 60 * time.Second
-	defaultJobTTL       = 6 * time.Hour
-	defaultResyncPeriod = 30 * time.Second
-	defaultStartupGrace = 5 * time.Minute
+	DefaultMaxRunners   = 3
+	DefaultMinReplicas  = 1
+	DefaultPort         = "8080"
+	DefaultRunnerLabels = "self-hosted,railway"
+	DefaultIdleCooldown = 60 * time.Second
+	DefaultJobTTL       = 6 * time.Hour
+	DefaultResyncPeriod = 30 * time.Second
+	DefaultStartupGrace = 5 * time.Minute
 )
 
-func loadConfig() (Config, error) {
+// Load reads configuration from the environment, applying defaults and
+// rejecting values that would misconfigure scaling.
+func Load() (Config, error) {
 	cfg := Config{
-		MaxRunners:   defaultMaxRunners,
-		MinReplicas:  defaultMinReplicas,
-		Port:         defaultPort,
-		IdleCooldown: defaultIdleCooldown,
-		JobTTL:       defaultJobTTL,
-		ResyncPeriod: defaultResyncPeriod,
-		StartupGrace: defaultStartupGrace,
+		MaxRunners:   DefaultMaxRunners,
+		MinReplicas:  DefaultMinReplicas,
+		Port:         DefaultPort,
+		IdleCooldown: DefaultIdleCooldown,
+		JobTTL:       DefaultJobTTL,
+		ResyncPeriod: DefaultResyncPeriod,
+		StartupGrace: DefaultStartupGrace,
 	}
 
 	// Required.
@@ -79,7 +87,7 @@ func loadConfig() (Config, error) {
 	// Overridable mainly for tests and proxies; defaults to Railway's public API.
 	cfg.APIEndpoint = strings.TrimSpace(os.Getenv("RAILWAY_API_URL"))
 	if cfg.APIEndpoint == "" {
-		cfg.APIEndpoint = DefaultRailwayEndpoint
+		cfg.APIEndpoint = railway.DefaultEndpoint
 	}
 
 	if err := envInt("MAX_RUNNERS", 1, &cfg.MaxRunners); err != nil {
@@ -117,9 +125,9 @@ func loadConfig() (Config, error) {
 
 	labels := os.Getenv("RUNNER_LABELS")
 	if strings.TrimSpace(labels) == "" {
-		labels = defaultRunnerLabels
+		labels = DefaultRunnerLabels
 	}
-	cfg.RunnerLabels = normalizeLabels(labels)
+	cfg.RunnerLabels = NormalizeLabels(labels)
 	if len(cfg.RunnerLabels) == 0 {
 		return Config{}, fmt.Errorf("RUNNER_LABELS must contain at least one non-empty label")
 	}
@@ -127,9 +135,29 @@ func loadConfig() (Config, error) {
 	return cfg, nil
 }
 
-// normalizeLabels splits a comma-separated label list, lowercasing and
+// ScalerOptions projects the config onto the scaler package's options.
+func (c Config) ScalerOptions() scaler.Options {
+	return scaler.Options{
+		MinReplicas:  c.MinReplicas,
+		MaxRunners:   c.MaxRunners,
+		IdleCooldown: c.IdleCooldown,
+		StartupGrace: c.StartupGrace,
+		JobTTL:       c.JobTTL,
+		ResyncPeriod: c.ResyncPeriod,
+	}
+}
+
+// WebhookOptions projects the config onto the webhook package's options.
+func (c Config) WebhookOptions() webhook.Options {
+	return webhook.Options{
+		Secret: c.WebhookSecret,
+		Labels: c.RunnerLabels,
+	}
+}
+
+// NormalizeLabels splits a comma-separated label list, lowercasing and
 // dropping blanks so matching is stable regardless of how it was written.
-func normalizeLabels(s string) []string {
+func NormalizeLabels(s string) []string {
 	var out []string
 	for _, part := range strings.Split(s, ",") {
 		if l := strings.ToLower(strings.TrimSpace(part)); l != "" {

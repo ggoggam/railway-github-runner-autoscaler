@@ -20,6 +20,21 @@ GitHub ──workflow_job webhook──▶ autoscaler ──GraphQL──▶ Rai
 
 Each runner replica is an **ephemeral** runner: it registers, takes exactly one job, then exits. Railway restarts it, and it registers again. The autoscaler only decides *how many* of those replicas should exist.
 
+## Layout
+
+```
+cmd/autoscaler/      entrypoint: config loading, wiring, graceful shutdown
+internal/config/     environment parsing and validation
+internal/scaler/     job tracking and the reconcile loop (the scaling logic)
+internal/railway/    Railway GraphQL client: replica reads/writes, retries
+internal/webhook/    GitHub webhook auth, parsing, and HTTP routes
+internal/bounded/    fixed-capacity set used for de-duplication
+```
+
+`scaler` and `webhook` each define their own `Options` struct and depend on
+narrow interfaces (`Backend`, `Tracker`) rather than on `config`, so both are
+testable in isolation.
+
 ## Prerequisites: the runner service
 
 This autoscaler is only half the system. The runner service it scales **must** be configured with:
@@ -133,7 +148,8 @@ Failed scales are not lost: the reconcile loop retries every `RESYNC_PERIOD` unt
 - Go 1.22 → **1.26**; `log` → structured `log/slog`.
 - **Multi-arch Dockerfile** (upstream hardcoded `GOARCH=amd64`), build cache mounts, and a distroless non-root base instead of `scratch`.
 - **Graceful shutdown**, HTTP server timeouts, and a `/status` endpoint.
-- **Tests**: 67 covering the scaling state machine, webhook auth, retry behaviour, and concurrency under `-race`.
+- **Tests**: 69 covering the scaling state machine, webhook auth, retry behaviour, and concurrency under `-race` — 94% coverage on `scaler`, 100% on `config`.
+- **Package layout** split out of a flat root into `cmd/` plus focused `internal/` packages.
 
 ## Development
 
