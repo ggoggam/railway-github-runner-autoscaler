@@ -1,5 +1,6 @@
 # Binaries
 /autoscaler
+/railway-github-runner-autoscaler
 /out/
 *.exe
 

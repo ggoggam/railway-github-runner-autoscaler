@@ -4,6 +4,12 @@ Scales a pool of self-hosted GitHub Actions runners on [Railway](https://railway
 
 A small Go service that listens for GitHub webhooks, tracks how many jobs are waiting or running, and drives the runner service's replica count to match — scaling up the moment work arrives and back down once it is safe.
 
+[![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/template/REPLACE_WITH_TEMPLATE_CODE)
+
+The template deploys both halves — this autoscaler and the runner pool it scales
+— already wired together. You supply two tokens and add one GitHub webhook.
+Publishing notes live in [TEMPLATE.md](TEMPLATE.md).
+
 This is a modernized fork of [shaezzy/railway-github-runner-autoscaler](https://github.com/shaezzy/railway-github-runner-autoscaler). See [What changed](#what-changed-from-upstream).
 
 ---
@@ -45,13 +51,16 @@ This autoscaler is only half the system. The runner service it scales **must** b
 | `restartPolicyMaxRetries` | high (e.g. `1000`) | One exit per job means restarts are routine, not failures. A low cap gets exhausted and the deployment is marked `CRASHED`. |
 | `EPHEMERAL` | `true` | One job per container. Without it a runner persists across jobs and state leaks between them. |
 
-A `railway.runner.json` is included as a starting point. Getting `restartPolicyType` wrong is the single most common cause of a runner pool that "keeps crashing".
+A `railway.runner.json` is included as a starting point, and the [Railway template](#railway-template) sets all three for you. Getting `restartPolicyType` wrong is the single most common cause of a runner pool that "keeps crashing".
 
 ## Setup
 
 ### 1. Deploy this service
 
-Point a Railway service at this repo. It builds from the included `Dockerfile`.
+The [template](#railway-template) does this and the runner service together. To
+wire it up by hand instead, point a Railway service at this repo — it builds from
+the included `Dockerfile` — and create the runner service yourself per
+[Prerequisites](#prerequisites-the-runner-service).
 
 ### 2. Configure it
 
@@ -60,9 +69,21 @@ Required:
 | Variable | Description |
 | --- | --- |
 | `GITHUB_WEBHOOK_SECRET` | Shared secret from the GitHub webhook config. |
-| `RAILWAY_API_TOKEN` | Account or workspace token from [railway.com/account/tokens](https://railway.com/account/tokens). |
-| `RAILWAY_RUNNER_SERVICE_ID` | Service ID of the **runner** service to scale. |
+| `RAILWAY_API_TOKEN` | Workspace token from [railway.com/account/tokens](https://railway.com/account/tokens). A workspace token is scoped to one workspace; prefer it over an account token. |
+| `RAILWAY_PROJECT_ID` | Injected automatically by Railway. Needed to resolve the runner service by name. |
 | `RAILWAY_ENVIRONMENT_ID` | Injected automatically by Railway. |
+
+The runner service is addressed by **name**, not ID:
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `RAILWAY_RUNNER_SERVICE_NAME` | `Runner` | Name of the runner service to scale, resolved against `RAILWAY_PROJECT_ID` at startup. An exact match wins; a single case-insensitive match is accepted; two matches are a startup error rather than a coin flip. |
+| `RAILWAY_RUNNER_SERVICE_ID` | unset | Explicit service ID. Skips the name lookup entirely, and makes `RAILWAY_PROJECT_ID` unnecessary. |
+
+A service ID does not exist until a template is deployed, which is why the name
+is the default path. If the runner service is not resolvable yet — a template
+creates every service at once — startup retries for two minutes before giving
+up, so a first deploy is not a crash loop.
 
 Optional:
 
@@ -75,7 +96,7 @@ Optional:
 | `STARTUP_GRACE` | `5m` | After a restart, hold existing replicas this long before any scale-down. |
 | `JOB_TTL` | `6h` | Forget jobs whose completion webhook never arrived. |
 | `RESYNC_PERIOD` | `30s` | How often to reconcile against GitHub, retry failed scales, and expire stale jobs. |
-| `GITHUB_API_TOKEN` | unset | Enables reconciliation against GitHub (see below). Needs `repo` scope, or fine-grained **Administration: read** + **Actions: read**. Pairs with `GITHUB_API_REPOSITORY`. |
+| `GITHUB_API_TOKEN` | unset | Enables reconciliation against GitHub (see below). Needs `repo` scope, or fine-grained **Administration: read** + **Actions: read**. Pairs with `GITHUB_API_REPOSITORY`. Sharing one PAT with the runner service needs **Administration: read and write**, since registering a runner is a write. |
 | `GITHUB_API_REPOSITORY` | unset | `owner/repo` to reconcile against. Required with `GITHUB_API_TOKEN`; setting one without the other is a startup error. |
 | `RUNNER_GRACE` | `3m` | How long the pool may report replicas but no live runner before those replicas are recycled. Ignored without `GITHUB_API_TOKEN`. |
 | `GITHUB_API_ENDPOINT` | GitHub public API | Override the REST endpoint (tests, GHES). |
@@ -106,6 +127,20 @@ jobs:
 ```
 
 The labels must match `RUNNER_LABELS`.
+
+## Railway template
+
+The [template](https://railway.com/template/REPLACE_WITH_TEMPLATE_CODE) deploys
+both services already connected: this autoscaler, and a `Runner` service running
+`myoung34/github-runner` with the restart policy an ephemeral runner needs. The
+webhook secret is generated for you, and the runner reads the GitHub token, repo,
+and labels from the autoscaler by reference, so each is entered once.
+
+What it cannot do for you: mint your GitHub PAT, mint your Railway token, or add
+the webhook to your repository. Those are steps 2 and 3 above.
+
+[TEMPLATE.md](TEMPLATE.md) records the exact service configuration, for anyone
+republishing or reproducing the template.
 
 ## Endpoints
 
