@@ -21,6 +21,11 @@ type Config struct {
 	RunnerLabels  []string
 	// GitHubToken and Repository enable reconciliation against GitHub. Both
 	// must be set; leaving them empty runs the autoscaler webhook-only.
+	//
+	// These deliberately avoid the GITHUB_TOKEN / GITHUB_REPOSITORY /
+	// GITHUB_API_URL names: GitHub Actions injects those into every workflow
+	// step, so reusing them means any Actions context silently supplies half a
+	// configuration.
 	GitHubToken  string
 	Repository   string
 	GitHubAPIURL string
@@ -99,20 +104,20 @@ func Load() (Config, error) {
 	// Optional, but paired: reconciling against GitHub needs both a credential
 	// and a repository to ask about. Accepting one without the other would
 	// silently leave the autoscaler webhook-only.
-	cfg.GitHubToken = strings.TrimSpace(os.Getenv("GITHUB_TOKEN"))
-	cfg.Repository = strings.TrimSpace(os.Getenv("GITHUB_REPOSITORY"))
+	cfg.GitHubToken = strings.TrimSpace(os.Getenv("GITHUB_API_TOKEN"))
+	cfg.Repository = strings.TrimSpace(os.Getenv("GITHUB_API_REPOSITORY"))
 	switch {
 	case cfg.GitHubToken != "" && cfg.Repository == "":
-		return Config{}, fmt.Errorf("GITHUB_REPOSITORY is required when GITHUB_TOKEN is set")
+		return Config{}, fmt.Errorf("GITHUB_API_REPOSITORY is required when GITHUB_API_TOKEN is set")
 	case cfg.Repository != "" && cfg.GitHubToken == "":
-		return Config{}, fmt.Errorf("GITHUB_TOKEN is required when GITHUB_REPOSITORY is set")
+		return Config{}, fmt.Errorf("GITHUB_API_TOKEN is required when GITHUB_API_REPOSITORY is set")
 	case cfg.Repository != "":
 		if _, _, err := github.SplitRepository(cfg.Repository); err != nil {
-			return Config{}, fmt.Errorf("GITHUB_REPOSITORY: %w", err)
+			return Config{}, fmt.Errorf("GITHUB_API_REPOSITORY: %w", err)
 		}
 	}
 
-	cfg.GitHubAPIURL = strings.TrimSpace(os.Getenv("GITHUB_API_URL"))
+	cfg.GitHubAPIURL = strings.TrimSpace(os.Getenv("GITHUB_API_ENDPOINT"))
 	if cfg.GitHubAPIURL == "" {
 		cfg.GitHubAPIURL = github.DefaultEndpoint
 	}

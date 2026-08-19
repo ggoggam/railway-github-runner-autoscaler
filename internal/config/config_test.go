@@ -1,6 +1,7 @@
 package config
 
 import (
+	"github.com/ggoggam/railway-github-runner-autoscaler/internal/github"
 	"reflect"
 	"testing"
 	"time"
@@ -157,9 +158,9 @@ func TestNormalizeLabels(t *testing.T) {
 // is the failure mode this feature exists to remove.
 func TestGitHubReconcileRequiresBothTokenAndRepository(t *testing.T) {
 	for name, env := range map[string]map[string]string{
-		"token without repository": {"GITHUB_TOKEN": "ghp_x"},
-		"repository without token": {"GITHUB_REPOSITORY": "acme/widgets"},
-		"malformed repository":     {"GITHUB_TOKEN": "ghp_x", "GITHUB_REPOSITORY": "acme"},
+		"token without repository": {"GITHUB_API_TOKEN": "ghp_x"},
+		"repository without token": {"GITHUB_API_REPOSITORY": "acme/widgets"},
+		"malformed repository":     {"GITHUB_API_TOKEN": "ghp_x", "GITHUB_REPOSITORY": "acme"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			setRequiredEnv(t)
@@ -193,8 +194,8 @@ func TestGitHubReconcileOptional(t *testing.T) {
 
 func TestGitHubReconcileEnabled(t *testing.T) {
 	setRequiredEnv(t)
-	t.Setenv("GITHUB_TOKEN", "ghp_x")
-	t.Setenv("GITHUB_REPOSITORY", "acme/widgets")
+	t.Setenv("GITHUB_API_TOKEN", "ghp_x")
+	t.Setenv("GITHUB_API_REPOSITORY", "acme/widgets")
 	t.Setenv("RUNNER_GRACE", "90s")
 
 	cfg, err := Load()
@@ -206,5 +207,27 @@ func TestGitHubReconcileEnabled(t *testing.T) {
 	}
 	if cfg.ScalerOptions().RunnerGrace != 90*time.Second {
 		t.Fatalf("got RunnerGrace %v", cfg.ScalerOptions().RunnerGrace)
+	}
+}
+
+// GitHub Actions injects GITHUB_REPOSITORY, GITHUB_TOKEN, and GITHUB_API_URL
+// into every workflow step. Reading those names would mean any Actions context
+// silently supplies half a configuration — which is exactly how this config
+// first broke its own CI.
+func TestActionsInjectedNamesAreIgnored(t *testing.T) {
+	setRequiredEnv(t)
+	t.Setenv("GITHUB_REPOSITORY", "acme/injected-by-actions")
+	t.Setenv("GITHUB_TOKEN", "injected-by-actions")
+	t.Setenv("GITHUB_API_URL", "https://api.github.com")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Actions' own env must not affect Load: %v", err)
+	}
+	if cfg.Repository != "" || cfg.GitHubToken != "" {
+		t.Fatalf("picked up Actions-injected config: %+v", cfg)
+	}
+	if cfg.GitHubAPIURL != github.DefaultEndpoint {
+		t.Fatalf("picked up Actions-injected API URL: %q", cfg.GitHubAPIURL)
 	}
 }
