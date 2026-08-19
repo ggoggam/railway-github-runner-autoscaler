@@ -12,9 +12,9 @@ COPY internal/ ./internal/
 # Cross-compile to whatever the target platform is rather than assuming amd64.
 ARG TARGETOS
 ARG TARGETARCH
-RUN --mount=type=cache,target=/root/.cache/go-build \
-    --mount=type=cache,target=/go/pkg/mod \
-    CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} \
+# No BuildKit cache mounts: Railway requires a literal id=s/<service-id>-<path>
+# on every cache mount, which would hardcode one service into this repo.
+RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} \
     go build -trimpath -ldflags="-s -w" -o /out/autoscaler ./cmd/autoscaler
 
 # distroless static ships CA certificates (needed for the Railway API over TLS)
