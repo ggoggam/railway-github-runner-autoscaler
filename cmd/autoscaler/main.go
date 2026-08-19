@@ -97,6 +97,50 @@ func logLevel() slog.Level {
 	}
 }
 
+// resolveWait bounds how long startup waits for the runner service to become
+// resolvable. A template creates every service at once, so the autoscaler can
+// boot before the runner record is queryable; failing fast there would crash-loop
+// a deploy that is actually fine.
+const resolveWait = 2 * time.Minute
+
+// resolveRetryInterval is how often the lookup is retried while waiting.
+const resolveRetryInterval = 5 * time.Second
+
+// resolveServiceID returns the runner service ID, looking it up by name when no
+// explicit ID was configured.
+func resolveServiceID(ctx context.Context, client *railway.Client, cfg config.Config, logger *slog.Logger) (string, error) {
+	if cfg.ServiceID != "" {
+		return cfg.ServiceID, nil
+	}
+
+	deadline := time.Now().Add(resolveWait)
+	for {
+		lookupCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		id, err := client.ResolveServiceID(lookupCtx, cfg.ProjectID, cfg.ServiceName)
+		cancel()
+		if err == nil {
+			logger.Info("resolved runner service", "name", cfg.ServiceName, "service", id)
+			return id, nil
+		}
+		// Anything other than a missing service is a real misconfiguration
+		// (bad token, wrong project) that waiting will not fix.
+		if !errors.Is(err, railway.ErrServiceNotFound) {
+			return "", fmt.Errorf("resolve runner service %q: %w", cfg.ServiceName, err)
+		}
+		if time.Now().After(deadline) {
+			return "", fmt.Errorf("resolve runner service %q: %w", cfg.ServiceName, err)
+		}
+
+		logger.Warn("runner service not found yet, retrying",
+			"name", cfg.ServiceName, "retryIn", resolveRetryInterval, "err", err)
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-time.After(resolveRetryInterval):
+		}
+	}
+}
+
 func run(logger *slog.Logger) error {
 	cfg, err := config.Load()
 	if err != nil {
@@ -109,7 +153,12 @@ func run(logger *slog.Logger) error {
 	client := railway.NewClient(cfg.RailwayToken, logger)
 	client.Endpoint = cfg.APIEndpoint
 
-	backend := &railwayBackend{client: client, serviceID: cfg.ServiceID, envID: cfg.EnvironmentID}
+	serviceID, err := resolveServiceID(ctx, client, cfg, logger)
+	if err != nil {
+		return err
+	}
+
+	backend := &railwayBackend{client: client, serviceID: serviceID, envID: cfg.EnvironmentID}
 	auto := scaler.New(cfg.ScalerOptions(), backend, logger)
 
 	// Optional: without a GitHub credential the autoscaler stays webhook-only,
@@ -128,7 +177,7 @@ func run(logger *slog.Logger) error {
 	// fatal: SetReplicas falls back to the legacy numReplicas field, and an
 	// unknown baseline just means the first reconcile applies desired state.
 	discoverCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	state, err := client.DiscoverServiceState(discoverCtx, cfg.ServiceID, cfg.EnvironmentID)
+	state, err := client.DiscoverServiceState(discoverCtx, serviceID, cfg.EnvironmentID)
 	cancel()
 	if err != nil {
 		logger.Warn("service discovery failed, falling back to legacy numReplicas", "err", err)
@@ -145,7 +194,7 @@ func run(logger *slog.Logger) error {
 	}
 
 	logger.Info("starting",
-		"service", cfg.ServiceID,
+		"service", serviceID,
 		"environment", cfg.EnvironmentID,
 		"regions", backend.regions,
 		"minReplicas", cfg.MinReplicas,

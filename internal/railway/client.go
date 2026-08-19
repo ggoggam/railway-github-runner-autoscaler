@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -326,4 +327,71 @@ func distribute(n int, regions []string) map[string]int {
 		out[r] = c
 	}
 	return out
+}
+
+const resolveServiceQuery = `
+query ProjectServices($projectId: String!) {
+  project(id: $projectId) {
+    services {
+      edges { node { id name } }
+    }
+  }
+}`
+
+// ErrServiceNotFound reports that no service in the project carries the given
+// name. It is worth retrying at startup: a template deploys every service at
+// once, so the autoscaler can boot before the runner record is queryable.
+var ErrServiceNotFound = errors.New("service not found")
+
+// ResolveServiceID looks up a service's ID by its name within a project.
+//
+// Templates cannot know a service ID ahead of time — it does not exist until the
+// template is deployed — so the runner is addressed by the name the template
+// gives it and resolved once at startup.
+//
+// An exact name match wins. Otherwise a single case-insensitive match is
+// accepted, since Railway names are user-visible and users re-case them. Two or
+// more matches are an error rather than a coin flip.
+func (c *Client) ResolveServiceID(ctx context.Context, projectID, name string) (string, error) {
+	var out struct {
+		Project struct {
+			Services struct {
+				Edges []struct {
+					Node struct {
+						ID   string `json:"id"`
+						Name string `json:"name"`
+					} `json:"node"`
+				} `json:"edges"`
+			} `json:"services"`
+		} `json:"project"`
+	}
+
+	if err := c.do(ctx, request{
+		Query:     resolveServiceQuery,
+		Variables: map[string]any{"projectId": projectID},
+	}, &out); err != nil {
+		return "", err
+	}
+
+	var loose, seen []string
+	for _, e := range out.Project.Services.Edges {
+		seen = append(seen, e.Node.Name)
+		switch {
+		case e.Node.Name == name:
+			return e.Node.ID, nil
+		case strings.EqualFold(strings.TrimSpace(e.Node.Name), strings.TrimSpace(name)):
+			loose = append(loose, e.Node.ID)
+		}
+	}
+
+	switch len(loose) {
+	case 1:
+		return loose[0], nil
+	case 0:
+		return "", fmt.Errorf("%w: no service named %q in project %s (found: %s)",
+			ErrServiceNotFound, name, projectID, strings.Join(seen, ", "))
+	default:
+		return "", fmt.Errorf("%d services in project %s match %q case-insensitively; "+
+			"set RAILWAY_RUNNER_SERVICE_ID explicitly", len(loose), projectID, name)
+	}
 }
