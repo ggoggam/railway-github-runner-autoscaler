@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ggoggam/railway-github-runner-autoscaler/internal/github"
 	"github.com/ggoggam/railway-github-runner-autoscaler/internal/railway"
 	"github.com/ggoggam/railway-github-runner-autoscaler/internal/scaler"
 	"github.com/ggoggam/railway-github-runner-autoscaler/internal/webhook"
@@ -18,6 +19,12 @@ type Config struct {
 	// GitHub
 	WebhookSecret string
 	RunnerLabels  []string
+	// GitHubToken and Repository enable reconciliation against GitHub. Both
+	// must be set; leaving them empty runs the autoscaler webhook-only.
+	GitHubToken  string
+	Repository   string
+	GitHubAPIURL string
+	RunnerGrace  time.Duration
 
 	// Railway
 	RailwayToken  string
@@ -48,6 +55,10 @@ const (
 	DefaultJobTTL       = 6 * time.Hour
 	DefaultResyncPeriod = 30 * time.Second
 	DefaultStartupGrace = 5 * time.Minute
+	// DefaultRunnerGrace comfortably exceeds the time a runner container needs
+	// to boot and register, so a pool mid-restart is never mistaken for a dead
+	// one.
+	DefaultRunnerGrace = 3 * time.Minute
 )
 
 // Load reads configuration from the environment, applying defaults and
@@ -61,6 +72,7 @@ func Load() (Config, error) {
 		JobTTL:       DefaultJobTTL,
 		ResyncPeriod: DefaultResyncPeriod,
 		StartupGrace: DefaultStartupGrace,
+		RunnerGrace:  DefaultRunnerGrace,
 	}
 
 	// Required.
@@ -83,6 +95,27 @@ func Load() (Config, error) {
 
 	// Optional. Empty means "discover from the service's current deployment".
 	cfg.Region = strings.TrimSpace(os.Getenv("RAILWAY_RUNNER_REGION"))
+
+	// Optional, but paired: reconciling against GitHub needs both a credential
+	// and a repository to ask about. Accepting one without the other would
+	// silently leave the autoscaler webhook-only.
+	cfg.GitHubToken = strings.TrimSpace(os.Getenv("GITHUB_TOKEN"))
+	cfg.Repository = strings.TrimSpace(os.Getenv("GITHUB_REPOSITORY"))
+	switch {
+	case cfg.GitHubToken != "" && cfg.Repository == "":
+		return Config{}, fmt.Errorf("GITHUB_REPOSITORY is required when GITHUB_TOKEN is set")
+	case cfg.Repository != "" && cfg.GitHubToken == "":
+		return Config{}, fmt.Errorf("GITHUB_TOKEN is required when GITHUB_REPOSITORY is set")
+	case cfg.Repository != "":
+		if _, _, err := github.SplitRepository(cfg.Repository); err != nil {
+			return Config{}, fmt.Errorf("GITHUB_REPOSITORY: %w", err)
+		}
+	}
+
+	cfg.GitHubAPIURL = strings.TrimSpace(os.Getenv("GITHUB_API_URL"))
+	if cfg.GitHubAPIURL == "" {
+		cfg.GitHubAPIURL = github.DefaultEndpoint
+	}
 
 	// Overridable mainly for tests and proxies; defaults to Railway's public API.
 	cfg.APIEndpoint = strings.TrimSpace(os.Getenv("RAILWAY_API_URL"))
@@ -108,6 +141,7 @@ func Load() (Config, error) {
 		{"JOB_TTL", &cfg.JobTTL},
 		{"RESYNC_PERIOD", &cfg.ResyncPeriod},
 		{"STARTUP_GRACE", &cfg.StartupGrace},
+		{"RUNNER_GRACE", &cfg.RunnerGrace},
 	} {
 		if err := envDuration(d.key, d.dst); err != nil {
 			return Config{}, err
@@ -144,6 +178,7 @@ func (c Config) ScalerOptions() scaler.Options {
 		StartupGrace: c.StartupGrace,
 		JobTTL:       c.JobTTL,
 		ResyncPeriod: c.ResyncPeriod,
+		RunnerGrace:  c.RunnerGrace,
 	}
 }
 
