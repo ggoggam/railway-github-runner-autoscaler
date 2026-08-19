@@ -3,11 +3,13 @@ package railway
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -247,5 +249,119 @@ func TestDefaultEndpointIsRailwayDotCom(t *testing.T) {
 	want := "https://backboard.railway.com/graphql/v2"
 	if DefaultEndpoint != want {
 		t.Fatalf("want %s, got %s", want, DefaultEndpoint)
+	}
+}
+
+// servicesResponse renders the project services payload the resolver reads.
+func servicesResponse(services map[string]string) string {
+	type node struct {
+		ID   string `json:"id"`
+		Name string `json:"name"`
+	}
+	var edges []map[string]node
+	for name, id := range services {
+		edges = append(edges, map[string]node{"node": {ID: id, Name: name}})
+	}
+	body, _ := json.Marshal(map[string]any{
+		"data": map[string]any{
+			"project": map[string]any{
+				"services": map[string]any{"edges": edges},
+			},
+		},
+	})
+	return string(body)
+}
+
+func TestResolveServiceIDByName(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(servicesResponse(map[string]string{
+			"Autoscaler": "svc-auto",
+			"Runner":     "svc-runner",
+		})))
+	}))
+	defer srv.Close()
+
+	got, err := newTestClient(t, srv.URL).ResolveServiceID(t.Context(), "proj", "Runner")
+	if err != nil {
+		t.Fatalf("ResolveServiceID: %v", err)
+	}
+	if got != "svc-runner" {
+		t.Errorf("got %q, want %q", got, "svc-runner")
+	}
+}
+
+// Service names are user-visible, so a user who re-cases one should not silently
+// lose autoscaling.
+func TestResolveServiceIDMatchesCaseInsensitively(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(servicesResponse(map[string]string{"runner": "svc-runner"})))
+	}))
+	defer srv.Close()
+
+	got, err := newTestClient(t, srv.URL).ResolveServiceID(t.Context(), "proj", "Runner")
+	if err != nil {
+		t.Fatalf("ResolveServiceID: %v", err)
+	}
+	if got != "svc-runner" {
+		t.Errorf("got %q, want %q", got, "svc-runner")
+	}
+}
+
+// An exact match must win outright, or a project holding both "Runner" and
+// "runner" would resolve by iteration order.
+func TestResolveServiceIDPrefersExactMatch(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(servicesResponse(map[string]string{
+			"Runner": "svc-exact",
+			"runner": "svc-loose",
+		})))
+	}))
+	defer srv.Close()
+
+	for range 20 { // iteration order over the response varies run to run
+		got, err := newTestClient(t, srv.URL).ResolveServiceID(t.Context(), "proj", "Runner")
+		if err != nil {
+			t.Fatalf("ResolveServiceID: %v", err)
+		}
+		if got != "svc-exact" {
+			t.Fatalf("got %q, want %q", got, "svc-exact")
+		}
+	}
+}
+
+// A missing service is retryable at startup, because a template creates every
+// service at once and the autoscaler may query before the runner is visible.
+func TestResolveServiceIDNotFoundIsDistinguishable(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(servicesResponse(map[string]string{"Autoscaler": "svc-auto"})))
+	}))
+	defer srv.Close()
+
+	_, err := newTestClient(t, srv.URL).ResolveServiceID(t.Context(), "proj", "Runner")
+	if !errors.Is(err, ErrServiceNotFound) {
+		t.Fatalf("err = %v, want ErrServiceNotFound", err)
+	}
+	// The names that were present are what tells a user they mistyped one.
+	if !strings.Contains(err.Error(), "Autoscaler") {
+		t.Errorf("error should list the services found, got %v", err)
+	}
+}
+
+// Two case-insensitive matches must fail loudly rather than scale a coin flip.
+func TestResolveServiceIDRejectsAmbiguousMatch(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(servicesResponse(map[string]string{
+			"runner": "svc-a",
+			"RUNNER": "svc-b",
+		})))
+	}))
+	defer srv.Close()
+
+	_, err := newTestClient(t, srv.URL).ResolveServiceID(t.Context(), "proj", "Runner")
+	if err == nil {
+		t.Fatal("want error when two services match case-insensitively")
+	}
+	if errors.Is(err, ErrServiceNotFound) {
+		t.Error("ambiguity is not retryable and must not report as not-found")
 	}
 }

@@ -46,7 +46,6 @@ func TestLoadRequiresEachSecret(t *testing.T) {
 	for _, missing := range []string{
 		"GITHUB_WEBHOOK_SECRET",
 		"RAILWAY_API_TOKEN",
-		"RAILWAY_RUNNER_SERVICE_ID",
 		"RAILWAY_ENVIRONMENT_ID",
 	} {
 		t.Run(missing, func(t *testing.T) {
@@ -229,5 +228,72 @@ func TestActionsInjectedNamesAreIgnored(t *testing.T) {
 	}
 	if cfg.GitHubAPIURL != github.DefaultEndpoint {
 		t.Fatalf("picked up Actions-injected API URL: %q", cfg.GitHubAPIURL)
+	}
+}
+
+// The runner service may be named instead of identified, so that a Railway
+// template — which cannot know a service ID before it is deployed — still
+// produces a working configuration.
+func TestLoadResolvesRunnerByNameWhenNoServiceID(t *testing.T) {
+	setRequiredEnv(t)
+	t.Setenv("RAILWAY_RUNNER_SERVICE_ID", "")
+	t.Setenv("RAILWAY_PROJECT_ID", "proj")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.ServiceID != "" {
+		t.Errorf("ServiceID = %q, want empty so startup resolves by name", cfg.ServiceID)
+	}
+	if cfg.ServiceName != DefaultServiceName {
+		t.Errorf("ServiceName = %q, want %q", cfg.ServiceName, DefaultServiceName)
+	}
+	if cfg.ProjectID != "proj" {
+		t.Errorf("ProjectID = %q, want %q", cfg.ProjectID, "proj")
+	}
+}
+
+func TestLoadHonoursExplicitRunnerServiceName(t *testing.T) {
+	setRequiredEnv(t)
+	t.Setenv("RAILWAY_RUNNER_SERVICE_ID", "")
+	t.Setenv("RAILWAY_PROJECT_ID", "proj")
+	t.Setenv("RAILWAY_RUNNER_SERVICE_NAME", "  GPU Runners  ")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.ServiceName != "GPU Runners" {
+		t.Errorf("ServiceName = %q, want %q", cfg.ServiceName, "GPU Runners")
+	}
+}
+
+// An explicit ID skips the lookup entirely, so it must not demand a project ID.
+func TestLoadServiceIDNeedsNoProjectID(t *testing.T) {
+	setRequiredEnv(t)
+	t.Setenv("RAILWAY_PROJECT_ID", "")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.ServiceID != "svc" {
+		t.Errorf("ServiceID = %q, want %q", cfg.ServiceID, "svc")
+	}
+	if cfg.ServiceName != "" {
+		t.Errorf("ServiceName = %q, want empty when an ID is given", cfg.ServiceName)
+	}
+}
+
+// Neither an ID nor a project to search is unresolvable, and saying so at
+// startup beats scaling nothing silently.
+func TestLoadRejectsNameWithoutProjectID(t *testing.T) {
+	setRequiredEnv(t)
+	t.Setenv("RAILWAY_RUNNER_SERVICE_ID", "")
+	t.Setenv("RAILWAY_PROJECT_ID", "")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("want error when neither RAILWAY_RUNNER_SERVICE_ID nor RAILWAY_PROJECT_ID is set")
 	}
 }

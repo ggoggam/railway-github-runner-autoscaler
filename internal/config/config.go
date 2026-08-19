@@ -32,8 +32,13 @@ type Config struct {
 	RunnerGrace  time.Duration
 
 	// Railway
-	RailwayToken  string
+	RailwayToken string
+	// ServiceID is the runner service to scale. Empty means resolve ServiceName
+	// against ProjectID at startup, which is what lets a template ship without
+	// an ID that does not exist until it is deployed.
 	ServiceID     string
+	ServiceName   string
+	ProjectID     string
 	EnvironmentID string
 	Region        string
 	APIEndpoint   string
@@ -56,6 +61,9 @@ const (
 	DefaultMinReplicas  = 1
 	DefaultPort         = "8080"
 	DefaultRunnerLabels = "self-hosted,railway"
+	// DefaultServiceName matches the service name the Railway template gives the
+	// runner pool.
+	DefaultServiceName  = "Runner"
 	DefaultIdleCooldown = 60 * time.Second
 	DefaultJobTTL       = 6 * time.Hour
 	DefaultResyncPeriod = 30 * time.Second
@@ -87,7 +95,6 @@ func Load() (Config, error) {
 	}{
 		{"GITHUB_WEBHOOK_SECRET", &cfg.WebhookSecret},
 		{"RAILWAY_API_TOKEN", &cfg.RailwayToken},
-		{"RAILWAY_RUNNER_SERVICE_ID", &cfg.ServiceID},
 		// Railway injects this automatically; the GraphQL mutation rejects an empty value.
 		{"RAILWAY_ENVIRONMENT_ID", &cfg.EnvironmentID},
 	} {
@@ -96,6 +103,23 @@ func Load() (Config, error) {
 			return Config{}, fmt.Errorf("%s is required", req.key)
 		}
 		*req.dst = v
+	}
+
+	// The runner service is addressed either by ID or by name. An explicit ID
+	// wins; otherwise the name is resolved against the project at startup, which
+	// needs the project ID Railway injects.
+	cfg.ServiceID = strings.TrimSpace(os.Getenv("RAILWAY_RUNNER_SERVICE_ID"))
+	cfg.ServiceName = strings.TrimSpace(os.Getenv("RAILWAY_RUNNER_SERVICE_NAME"))
+	cfg.ProjectID = strings.TrimSpace(os.Getenv("RAILWAY_PROJECT_ID"))
+	if cfg.ServiceID == "" {
+		if cfg.ServiceName == "" {
+			cfg.ServiceName = DefaultServiceName
+		}
+		if cfg.ProjectID == "" {
+			return Config{}, fmt.Errorf(
+				"RAILWAY_PROJECT_ID is required to resolve RAILWAY_RUNNER_SERVICE_NAME (%q); "+
+					"set RAILWAY_RUNNER_SERVICE_ID instead to skip the lookup", cfg.ServiceName)
+		}
 	}
 
 	// Optional. Empty means "discover from the service's current deployment".
