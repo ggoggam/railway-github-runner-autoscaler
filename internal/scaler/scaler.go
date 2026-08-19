@@ -16,6 +16,32 @@ type Backend interface {
 	SetReplicas(ctx context.Context, n int) error
 }
 
+// Observation is ground truth read back from GitHub.
+type Observation struct {
+	// Queued and InProgress are the job IDs GitHub currently reports for our
+	// labels.
+	Queued     []int64
+	InProgress []int64
+	// LiveRunners is the number of runners registered and online. Offline
+	// registrations left behind by runners that died without deregistering do
+	// not count.
+	LiveRunners int
+}
+
+// Observer reports ground truth from GitHub.
+//
+// It is optional: without one the autoscaler runs webhook-only, which is
+// correct until a delivery is lost or a replica stops holding a live runner.
+// Neither is recoverable from in-memory state alone, because both make the
+// autoscaler believe it is already in the state it wants.
+type Observer interface {
+	Observe(ctx context.Context) (Observation, error)
+}
+
+// observeTimeout caps a single Observe call so a slow GitHub cannot stall the
+// reconcile loop past its next tick.
+const observeTimeout = 20 * time.Second
+
 // trackedJobs is the number of terminal job IDs kept to guard against
 // out-of-order webhook delivery.
 const trackedJobs = 4096
@@ -32,8 +58,13 @@ type Options struct {
 	StartupGrace time.Duration
 	// JobTTL forgets jobs whose completion webhook never arrived.
 	JobTTL time.Duration
-	// ResyncPeriod is how often to retry failed scales and expire stale jobs.
+	// ResyncPeriod is how often to reconcile against GitHub, retry failed
+	// scales, and expire stale jobs.
 	ResyncPeriod time.Duration
+	// RunnerGrace is how long the pool may report replicas but no live runner
+	// before those replicas are recycled. It must comfortably exceed the time
+	// a container needs to boot and register. Ignored without an Observer.
+	RunnerGrace time.Duration
 }
 
 // Autoscaler tracks jobs and reconciles the replica count.
@@ -42,10 +73,11 @@ type Options struct {
 // mutate in-memory counters and poke a trigger channel, so concurrent webhook
 // deliveries can never interleave a read-modify-write against the API.
 type Autoscaler struct {
-	opts    Options
-	backend Backend
-	logger  *slog.Logger
-	now     func() time.Time
+	opts     Options
+	backend  Backend
+	observer Observer // nil disables reconciliation against GitHub
+	logger   *slog.Logger
+	now      func() time.Time
 
 	mu         sync.Mutex
 	queued     map[int64]time.Time
@@ -55,25 +87,40 @@ type Autoscaler struct {
 	startedAt  time.Time
 	applied    int // replica count last applied; -1 when unknown
 
+	// liveRunners is the last observed count of online runners; -1 until an
+	// observation succeeds. missingSince is when the pool was first seen with
+	// replicas but no live runner, zero when healthy.
+	liveRunners  int
+	missingSince time.Time
+
 	trigger chan struct{}
 }
 
 // New returns an Autoscaler that drives backend towards observed job demand.
 func New(opts Options, backend Backend, logger *slog.Logger) *Autoscaler {
 	a := &Autoscaler{
-		opts:       opts,
-		backend:    backend,
-		logger:     logger,
-		now:        time.Now,
-		queued:     make(map[int64]time.Time),
-		inProgress: make(map[int64]time.Time),
-		done:       bounded.NewSet[int64](trackedJobs),
-		applied:    -1,
-		trigger:    make(chan struct{}, 1),
+		opts:        opts,
+		backend:     backend,
+		logger:      logger,
+		now:         time.Now,
+		queued:      make(map[int64]time.Time),
+		inProgress:  make(map[int64]time.Time),
+		done:        bounded.NewSet[int64](trackedJobs),
+		applied:     -1,
+		liveRunners: -1,
+		trigger:     make(chan struct{}, 1),
 	}
 	a.lastBusy = a.now()
 	a.startedAt = a.lastBusy
 	return a
+}
+
+// SetObserver installs the GitHub ground-truth source. It must be called before
+// Run.
+func (a *Autoscaler) SetObserver(o Observer) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.observer = o
 }
 
 // SetBaseline records the replica count the service already has, so a freshly
@@ -203,13 +250,173 @@ func (a *Autoscaler) decide() decision {
 	return d
 }
 
+// observe pulls ground truth from GitHub and folds it into the in-memory view.
+//
+// This is what makes a lost webhook survivable. GitHub never redelivers a
+// failed `queued` delivery, so without this the job is invisible forever and
+// the pool never scales up to meet it.
+func (a *Autoscaler) observe(ctx context.Context) {
+	a.mu.Lock()
+	obs := a.observer
+	a.mu.Unlock()
+	if obs == nil {
+		return
+	}
+
+	obsCtx, cancel := context.WithTimeout(ctx, observeTimeout)
+	defer cancel()
+
+	o, err := obs.Observe(obsCtx)
+	if err != nil {
+		// Keep the last known state; the next tick retries. Scaling continues
+		// on webhooks alone in the meantime.
+		a.logger.Warn("github observation failed", "err", err)
+		return
+	}
+	a.adopt(o)
+}
+
+// adopt reconciles observed jobs into the tracked maps and records runner
+// health.
+//
+// GitHub is authoritative about which jobs are outstanding, but it is not as
+// timely as a webhook: a job can be accepted here moments before the API lists
+// it. So observations only add jobs immediately, and remove a tracked job only
+// once it has been held longer than IdleCooldown without GitHub confirming it.
+func (a *Autoscaler) adopt(o Observation) {
+	a.mu.Lock()
+
+	seen := make(map[int64]struct{}, len(o.Queued)+len(o.InProgress))
+	var adopted []int64
+
+	for _, id := range o.Queued {
+		seen[id] = struct{}{}
+		if a.done.Has(id) {
+			continue
+		}
+		if _, tracked := a.inProgress[id]; tracked {
+			continue
+		}
+		if _, tracked := a.queued[id]; !tracked {
+			a.queued[id] = a.now()
+			a.lastBusy = a.now()
+			adopted = append(adopted, id)
+		}
+	}
+	for _, id := range o.InProgress {
+		seen[id] = struct{}{}
+		if a.done.Has(id) {
+			continue
+		}
+		if _, tracked := a.inProgress[id]; !tracked {
+			delete(a.queued, id)
+			a.inProgress[id] = a.now()
+			a.lastBusy = a.now()
+			adopted = append(adopted, id)
+		}
+	}
+
+	// Jobs we still track that GitHub no longer reports have finished without
+	// us seeing the completion. Dropping them here reclaims capacity far
+	// sooner than JobTTL would.
+	cutoff := a.now().Add(-a.opts.IdleCooldown)
+	var dropped []int64
+	for _, m := range []map[int64]time.Time{a.queued, a.inProgress} {
+		for id, at := range m {
+			if _, ok := seen[id]; ok || !at.Before(cutoff) {
+				continue
+			}
+			delete(m, id)
+			a.done.Add(id)
+			dropped = append(dropped, id)
+		}
+	}
+
+	a.liveRunners = o.LiveRunners
+	// Track how long the pool has claimed replicas without a single live
+	// runner behind them.
+	switch {
+	case a.applied > 0 && o.LiveRunners == 0:
+		if a.missingSince.IsZero() {
+			a.missingSince = a.now()
+		}
+	default:
+		a.missingSince = time.Time{}
+	}
+
+	q, ip, live, missing := len(a.queued), len(a.inProgress), a.liveRunners, a.missingSince
+	a.mu.Unlock()
+
+	if len(adopted) > 0 {
+		a.logger.Info("adopted jobs missed by webhooks",
+			"jobs", adopted, "queued", q, "inProgress", ip)
+	}
+	if len(dropped) > 0 {
+		a.logger.Info("dropped jobs github no longer reports",
+			"jobs", dropped, "queued", q, "inProgress", ip)
+	}
+	if !missing.IsZero() {
+		a.logger.Warn("replicas report no live runner", "liveRunners", live, "since", missing.UTC())
+	}
+}
+
+// recycleDue reports whether the pool has claimed replicas with no live runner
+// for longer than RunnerGrace.
+//
+// The condition is deliberately narrow: only a total outage qualifies. With
+// zero live runners nothing can be executing on this pool, so tearing the
+// replicas down cannot kill a running job. A partial shortfall is left alone
+// precisely because it cannot be distinguished from a runner that is mid-job.
+func (a *Autoscaler) recycleDue() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if a.observer == nil || a.opts.RunnerGrace <= 0 {
+		return false
+	}
+	if a.applied <= 0 || a.liveRunners != 0 || a.missingSince.IsZero() {
+		return false
+	}
+	if a.now().Sub(a.startedAt) < a.opts.StartupGrace {
+		return false // still learning; discovery may simply not have caught up
+	}
+	return a.now().Sub(a.missingSince) >= a.opts.RunnerGrace
+}
+
+// recycle tears the pool down and brings it back to n.
+//
+// Re-applying the same replica count is a no-op on Railway, so a pool whose
+// containers have exited cannot be revived by SetReplicas(n) alone. Going
+// through zero is what forces fresh containers.
+func (a *Autoscaler) recycle(ctx context.Context, n int) error {
+	if err := a.backend.SetReplicas(ctx, 0); err != nil {
+		return err
+	}
+	if err := a.backend.SetReplicas(ctx, n); err != nil {
+		// Leave applied unknown: the pool is at zero but the restore failed,
+		// so the next tick must not treat n as already applied.
+		a.mu.Lock()
+		a.applied = 0
+		a.mu.Unlock()
+		return err
+	}
+
+	a.mu.Lock()
+	a.applied = n
+	a.missingSince = a.now() // restart the grace so we do not loop on it
+	a.mu.Unlock()
+	return nil
+}
+
 func (a *Autoscaler) reconcile(ctx context.Context) {
+	a.observe(ctx)
 	a.gc()
 
 	d := a.decide()
 
 	a.mu.Lock()
 	applied := a.applied
+	live := a.liveRunners
 	a.mu.Unlock()
 
 	if d.heldDown {
@@ -218,6 +425,20 @@ func (a *Autoscaler) reconcile(ctx context.Context) {
 		return
 	}
 	if d.desired == applied {
+		// The pool is where it should be on paper. If nothing is actually
+		// running behind those replicas, force them to be rebuilt.
+		if a.recycleDue() {
+			a.logger.Warn("recycling pool with no live runners",
+				"replicas", applied, "grace", a.opts.RunnerGrace)
+			if err := a.recycle(ctx, d.desired); err != nil {
+				a.logger.Error("recycle failed", "desired", d.desired, "err", err)
+				return
+			}
+			a.logger.Info("recycled pool", "replicas", d.desired)
+			return
+		}
+		a.logger.Debug("already at desired replicas",
+			"replicas", applied, "liveRunners", live, "queued", d.queued, "inProgress", d.inProgress)
 		return
 	}
 
@@ -272,9 +493,12 @@ func (a *Autoscaler) gc() {
 
 // Stats is a point-in-time snapshot, served by the /status endpoint.
 type Stats struct {
-	Queued      int    `json:"queued"`
-	InProgress  int    `json:"inProgress"`
-	Replicas    int    `json:"replicas"`
+	Queued     int `json:"queued"`
+	InProgress int `json:"inProgress"`
+	Replicas   int `json:"replicas"`
+	// LiveRunners is the last observed count of online runners, or -1 when no
+	// observation has succeeded (including when running webhook-only).
+	LiveRunners int    `json:"liveRunners"`
 	MinReplicas int    `json:"minReplicas"`
 	MaxRunners  int    `json:"maxRunners"`
 	LastBusy    string `json:"lastBusy"`
@@ -288,6 +512,7 @@ func (a *Autoscaler) Stats() Stats {
 		Queued:      len(a.queued),
 		InProgress:  len(a.inProgress),
 		Replicas:    a.applied,
+		LiveRunners: a.liveRunners,
 		MinReplicas: a.opts.MinReplicas,
 		MaxRunners:  a.opts.MaxRunners,
 		LastBusy:    a.lastBusy.UTC().Format(time.RFC3339),

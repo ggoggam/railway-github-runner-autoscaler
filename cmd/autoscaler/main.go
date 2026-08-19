@@ -5,6 +5,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -15,6 +16,7 @@ import (
 	"time"
 
 	"github.com/ggoggam/railway-github-runner-autoscaler/internal/config"
+	"github.com/ggoggam/railway-github-runner-autoscaler/internal/github"
 	"github.com/ggoggam/railway-github-runner-autoscaler/internal/railway"
 	"github.com/ggoggam/railway-github-runner-autoscaler/internal/scaler"
 	"github.com/ggoggam/railway-github-runner-autoscaler/internal/webhook"
@@ -30,6 +32,46 @@ type railwayBackend struct {
 
 func (b *railwayBackend) SetReplicas(ctx context.Context, n int) error {
 	return b.client.SetReplicas(ctx, b.serviceID, b.envID, b.regions, n)
+}
+
+// githubObserver reads the repository's outstanding jobs and live runners,
+// filtered to the labels this pool serves.
+type githubObserver struct {
+	client *github.Client
+	labels []string
+}
+
+func (o *githubObserver) Observe(ctx context.Context) (scaler.Observation, error) {
+	var obs scaler.Observation
+
+	runners, err := o.client.ListRunners(ctx)
+	if err != nil {
+		return obs, fmt.Errorf("list runners: %w", err)
+	}
+	for _, r := range runners {
+		// A runner advertises its own labels, so the same label match used for
+		// jobs decides whether it counts as capacity for this pool.
+		if r.Online() && webhook.MatchesLabels(r.Labels, o.labels) {
+			obs.LiveRunners++
+		}
+	}
+
+	jobs, err := o.client.ListActiveJobs(ctx)
+	if err != nil {
+		return obs, fmt.Errorf("list active jobs: %w", err)
+	}
+	for _, j := range jobs {
+		if !webhook.MatchesLabels(j.Labels, o.labels) {
+			continue
+		}
+		switch j.Status {
+		case "in_progress":
+			obs.InProgress = append(obs.InProgress, j.ID)
+		default: // "queued" and "waiting" both need a runner
+			obs.Queued = append(obs.Queued, j.ID)
+		}
+	}
+	return obs, nil
 }
 
 func main() {
@@ -70,6 +112,18 @@ func run(logger *slog.Logger) error {
 	backend := &railwayBackend{client: client, serviceID: cfg.ServiceID, envID: cfg.EnvironmentID}
 	auto := scaler.New(cfg.ScalerOptions(), backend, logger)
 
+	// Optional: without a GitHub credential the autoscaler stays webhook-only,
+	// which is how it behaved before and remains a valid way to run it.
+	if cfg.GitHubToken != "" {
+		owner, repo, err := github.SplitRepository(cfg.Repository)
+		if err != nil {
+			return err
+		}
+		gh := github.NewClient(cfg.GitHubToken, owner, repo, logger)
+		gh.Endpoint = cfg.GitHubAPIURL
+		auto.SetObserver(&githubObserver{client: gh, labels: cfg.RunnerLabels})
+	}
+
 	// Learn the service's current regions and replica count. Failure here is not
 	// fatal: SetReplicas falls back to the legacy numReplicas field, and an
 	// unknown baseline just means the first reconcile applies desired state.
@@ -101,6 +155,9 @@ func run(logger *slog.Logger) error {
 		"startupGrace", cfg.StartupGrace,
 		"resyncPeriod", cfg.ResyncPeriod,
 		"jobTTL", cfg.JobTTL,
+		"runnerGrace", cfg.RunnerGrace,
+		"githubReconcile", cfg.GitHubToken != "",
+		"repository", cfg.Repository,
 		"baselineReplicas", state.Replicas,
 	)
 

@@ -1,6 +1,7 @@
 package config
 
 import (
+	"github.com/ggoggam/railway-github-runner-autoscaler/internal/github"
 	"reflect"
 	"testing"
 	"time"
@@ -149,5 +150,84 @@ func TestNormalizeLabels(t *testing.T) {
 		if got := NormalizeLabels(tc.in); !reflect.DeepEqual(got, tc.want) {
 			t.Errorf("NormalizeLabels(%q) = %v, want %v", tc.in, got, tc.want)
 		}
+	}
+}
+
+// Reconciling against GitHub needs both a credential and a repository. Taking
+// one without the other would quietly leave the autoscaler webhook-only, which
+// is the failure mode this feature exists to remove.
+func TestGitHubReconcileRequiresBothTokenAndRepository(t *testing.T) {
+	for name, env := range map[string]map[string]string{
+		"token without repository": {"GITHUB_API_TOKEN": "ghp_x"},
+		"repository without token": {"GITHUB_API_REPOSITORY": "acme/widgets"},
+		"malformed repository":     {"GITHUB_API_TOKEN": "ghp_x", "GITHUB_REPOSITORY": "acme"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			setRequiredEnv(t)
+			for k, v := range env {
+				t.Setenv(k, v)
+			}
+			if _, err := Load(); err == nil {
+				t.Fatal("want an error, got none")
+			}
+		})
+	}
+}
+
+func TestGitHubReconcileOptional(t *testing.T) {
+	setRequiredEnv(t)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.GitHubToken != "" || cfg.Repository != "" {
+		t.Fatalf("want reconciliation disabled by default, got %+v", cfg)
+	}
+	if cfg.RunnerGrace != DefaultRunnerGrace {
+		t.Fatalf("want RunnerGrace default %v, got %v", DefaultRunnerGrace, cfg.RunnerGrace)
+	}
+	if cfg.GitHubAPIURL == "" {
+		t.Fatal("want a GitHub API endpoint default")
+	}
+}
+
+func TestGitHubReconcileEnabled(t *testing.T) {
+	setRequiredEnv(t)
+	t.Setenv("GITHUB_API_TOKEN", "ghp_x")
+	t.Setenv("GITHUB_API_REPOSITORY", "acme/widgets")
+	t.Setenv("RUNNER_GRACE", "90s")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Repository != "acme/widgets" {
+		t.Fatalf("got repository %q", cfg.Repository)
+	}
+	if cfg.ScalerOptions().RunnerGrace != 90*time.Second {
+		t.Fatalf("got RunnerGrace %v", cfg.ScalerOptions().RunnerGrace)
+	}
+}
+
+// GitHub Actions injects GITHUB_REPOSITORY, GITHUB_TOKEN, and GITHUB_API_URL
+// into every workflow step. Reading those names would mean any Actions context
+// silently supplies half a configuration — which is exactly how this config
+// first broke its own CI.
+func TestActionsInjectedNamesAreIgnored(t *testing.T) {
+	setRequiredEnv(t)
+	t.Setenv("GITHUB_REPOSITORY", "acme/injected-by-actions")
+	t.Setenv("GITHUB_TOKEN", "injected-by-actions")
+	t.Setenv("GITHUB_API_URL", "https://api.github.com")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Actions' own env must not affect Load: %v", err)
+	}
+	if cfg.Repository != "" || cfg.GitHubToken != "" {
+		t.Fatalf("picked up Actions-injected config: %+v", cfg)
+	}
+	if cfg.GitHubAPIURL != github.DefaultEndpoint {
+		t.Fatalf("picked up Actions-injected API URL: %q", cfg.GitHubAPIURL)
 	}
 }

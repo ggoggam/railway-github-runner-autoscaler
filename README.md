@@ -74,11 +74,17 @@ Optional:
 | `IDLE_COOLDOWN` | `60s` | Quiet period required before shrinking the pool. |
 | `STARTUP_GRACE` | `5m` | After a restart, hold existing replicas this long before any scale-down. |
 | `JOB_TTL` | `6h` | Forget jobs whose completion webhook never arrived. |
-| `RESYNC_PERIOD` | `30s` | How often to retry failed scales and expire stale jobs. |
+| `RESYNC_PERIOD` | `30s` | How often to reconcile against GitHub, retry failed scales, and expire stale jobs. |
+| `GITHUB_API_TOKEN` | unset | Enables reconciliation against GitHub (see below). Needs `repo` scope, or fine-grained **Administration: read** + **Actions: read**. Pairs with `GITHUB_API_REPOSITORY`. |
+| `GITHUB_API_REPOSITORY` | unset | `owner/repo` to reconcile against. Required with `GITHUB_API_TOKEN`; setting one without the other is a startup error. |
+| `RUNNER_GRACE` | `3m` | How long the pool may report replicas but no live runner before those replicas are recycled. Ignored without `GITHUB_API_TOKEN`. |
+| `GITHUB_API_ENDPOINT` | GitHub public API | Override the REST endpoint (tests, GHES). |
 | `RAILWAY_RUNNER_REGION` | discovered | Pin the region instead of reading it from the service. |
 | `RAILWAY_API_URL` | Railway public API | Override the GraphQL endpoint (tests, proxies). |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error`. |
 | `PORT` | `8080` | Listen port. |
+
+The GitHub variables are deliberately **not** named `GITHUB_TOKEN`, `GITHUB_REPOSITORY`, or `GITHUB_API_URL`. GitHub Actions injects all three into every workflow step, so reading those names would mean any Actions context silently supplies half a configuration.
 
 > **Run exactly one replica of the autoscaler.** Job state is in memory; a second replica would scale against its own partial view.
 
@@ -107,7 +113,7 @@ The labels must match `RUNNER_LABELS`.
 | --- | --- |
 | `POST /webhook` | GitHub `workflow_job` events. Rejects anything without a valid HMAC signature. |
 | `GET /health` | Liveness probe. |
-| `GET /status` | Current queued/in-progress counts and replica state. |
+| `GET /status` | Current queued/in-progress counts, replica state, and last observed live-runner count (`-1` when running webhook-only). |
 
 ## Scaling behaviour
 
@@ -125,6 +131,23 @@ All Railway mutations happen on a single reconciler goroutine. Webhook handlers 
 
 Failed scales are not lost: the reconcile loop retries every `RESYNC_PERIOD` until the desired state is reached.
 
+## Reconciling against GitHub
+
+Webhooks alone are not enough to stay correct, because both of the ways they fail leave the autoscaler believing it is already in the state it wants:
+
+- **A delivery is lost.** GitHub does not retry a failed webhook. If the autoscaler is redeploying when a `queued` event fires, that job is invisible forever and the pool never grows to meet it.
+- **A replica stops holding a live runner.** Replica count is a proxy for capacity, and it stops being true the moment a runner exits without its container being rebuilt. `applied == desired`, so every reconcile is a no-op, and the pool serves nothing indefinitely.
+
+Setting `GITHUB_API_TOKEN` and `GITHUB_API_REPOSITORY` adds a second, authoritative input. Each resync the autoscaler reads the repository's live runners and its queued and in-progress jobs, then:
+
+- **adopts** jobs GitHub reports that it never saw, which is what makes a lost `queued` delivery recoverable;
+- **drops** tracked jobs GitHub no longer reports, reclaiming capacity far sooner than `JOB_TTL` would;
+- **recycles** the pool — scaling to zero and back — when it has held replicas with *zero* live runners for longer than `RUNNER_GRACE`. Re-applying the same replica count is a no-op on Railway, so going through zero is what forces fresh containers.
+
+The recycle condition is deliberately narrow. Only a total outage qualifies: with zero live runners nothing can be executing, so tearing the replicas down cannot kill a running job. A partial shortfall is left alone precisely because it is indistinguishable from a runner that is mid-job.
+
+Observation is a correction, not a dependency. If GitHub is unreachable the autoscaler logs a warning and keeps scaling on webhooks alone, and without a token it behaves exactly as it did before.
+
 ## What changed from upstream
 
 ### Correctness
@@ -135,6 +158,7 @@ Failed scales are not lost: the reconcile loop retries every `RESYNC_PERIOD` unt
 - **Handle out-of-order webhooks.** A late `in_progress` for a finished job used to resurrect it permanently. Terminal jobs are now remembered.
 - **Dedupe redelivered webhooks** via `X-GitHub-Delivery`; GitHub retries deliveries.
 - **Retry failed scales.** Upstream returned 500 and relied on GitHub redelivering. Reconciliation is now asynchronous and self-healing.
+- **Reconcile against GitHub.** In-memory state drifts from reality whenever a webhook is lost or a replica stops holding a live runner, and neither is recoverable from in-memory state alone — both make the autoscaler believe it is already where it wants to be. With a `GITHUB_API_TOKEN` the resync loop now reads live runners and outstanding jobs, and recycles a pool that has replicas but nothing running behind them.
 
 ### Railway API
 
