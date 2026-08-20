@@ -19,8 +19,11 @@ type Config struct {
 	// GitHub
 	WebhookSecret string
 	RunnerLabels  []string
-	// GitHubToken and Repository enable reconciliation against GitHub. Both
-	// must be set; leaving them empty runs the autoscaler webhook-only.
+	// GitHubToken plus exactly one of Repository (owner/repo) or Organization
+	// enable reconciliation against GitHub. Leaving them all empty runs the
+	// autoscaler webhook-only. Organization selects org-scoped runners; note
+	// that GitHub has no org-level jobs API, so at org scope only runner
+	// liveness is reconciled and job state stays webhook-driven.
 	//
 	// These deliberately avoid the GITHUB_TOKEN / GITHUB_REPOSITORY /
 	// GITHUB_API_URL names: GitHub Actions injects those into every workflow
@@ -28,6 +31,7 @@ type Config struct {
 	// configuration.
 	GitHubToken  string
 	Repository   string
+	Organization string
 	GitHubAPIURL string
 	RunnerGrace  time.Duration
 
@@ -125,19 +129,29 @@ func Load() (Config, error) {
 	// Optional. Empty means "discover from the service's current deployment".
 	cfg.Region = strings.TrimSpace(os.Getenv("RAILWAY_RUNNER_REGION"))
 
-	// Optional, but paired: reconciling against GitHub needs both a credential
-	// and a repository to ask about. Accepting one without the other would
-	// silently leave the autoscaler webhook-only.
+	// Optional, but paired: reconciling against GitHub needs a credential and
+	// exactly one scope to ask about — a repository or an organization.
+	// Accepting a partial configuration would silently leave the autoscaler
+	// webhook-only.
 	cfg.GitHubToken = strings.TrimSpace(os.Getenv("GITHUB_API_TOKEN"))
 	cfg.Repository = strings.TrimSpace(os.Getenv("GITHUB_API_REPOSITORY"))
+	cfg.Organization = strings.TrimSpace(os.Getenv("GITHUB_API_ORGANIZATION"))
 	switch {
-	case cfg.GitHubToken != "" && cfg.Repository == "":
-		return Config{}, fmt.Errorf("GITHUB_API_REPOSITORY is required when GITHUB_API_TOKEN is set")
-	case cfg.Repository != "" && cfg.GitHubToken == "":
-		return Config{}, fmt.Errorf("GITHUB_API_TOKEN is required when GITHUB_API_REPOSITORY is set")
+	case cfg.Repository != "" && cfg.Organization != "":
+		return Config{}, fmt.Errorf("set GITHUB_API_REPOSITORY or GITHUB_API_ORGANIZATION, not both; " +
+			"runners register at exactly one scope")
+	case cfg.GitHubToken != "" && cfg.Repository == "" && cfg.Organization == "":
+		return Config{}, fmt.Errorf("GITHUB_API_REPOSITORY (owner/repo) or GITHUB_API_ORGANIZATION is required when GITHUB_API_TOKEN is set")
+	case (cfg.Repository != "" || cfg.Organization != "") && cfg.GitHubToken == "":
+		return Config{}, fmt.Errorf("GITHUB_API_TOKEN is required when GITHUB_API_REPOSITORY or GITHUB_API_ORGANIZATION is set")
 	case cfg.Repository != "":
 		if _, _, err := github.SplitRepository(cfg.Repository); err != nil {
 			return Config{}, fmt.Errorf("GITHUB_API_REPOSITORY: %w", err)
+		}
+	case cfg.Organization != "":
+		if strings.Contains(cfg.Organization, "/") {
+			return Config{}, fmt.Errorf("GITHUB_API_ORGANIZATION must be a bare org name, got %q; "+
+				"owner/repo belongs in GITHUB_API_REPOSITORY", cfg.Organization)
 		}
 	}
 

@@ -102,6 +102,28 @@ Leave `RUNNER_NAME` unset — a fixed name would collide across replicas. Leave
 `CONFIGURED_ACTIONS_RUNNER_FILES_DIR` unset too: it exists to avoid
 re-registering, which is the opposite of what an ephemeral runner wants.
 
+## Switching to org-scoped runners
+
+The template deploys repo-scoped, which is the common case and the one whose
+variables can be wired by reference. A deployed project is converted to serve a
+whole organization by changing variables only:
+
+| Service | Change |
+| --- | --- |
+| Autoscaler | Remove `GITHUB_API_REPOSITORY`; set `GITHUB_API_ORGANIZATION` to the org name. |
+| Runner | Remove `REPO_URL`; set `RUNNER_SCOPE` to `org` and `ORG_NAME` to the org name. |
+
+The PAT then needs org-runner permissions instead: classic `admin:org`, or
+fine-grained organization **Self-hosted runners: read and write** (write is the
+runner's registration; the autoscaler alone needs only read). The webhook must
+be added at the **organization** level so every repo's `workflow_job` events
+arrive.
+
+GitHub has no org-level jobs API, so at org scope the autoscaler reconciles
+runner liveness (dead pools are still detected and recycled) while job counts
+stay webhook-driven. The [README](README.md#org-scoped-runners) covers the
+consequences.
+
 ## Marketplace overview
 
 Paste [template-overview.md](template-overview.md) as the template overview. It

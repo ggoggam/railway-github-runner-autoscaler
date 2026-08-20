@@ -18,8 +18,13 @@ type Backend interface {
 
 // Observation is ground truth read back from GitHub.
 type Observation struct {
+	// JobsObserved reports whether Queued and InProgress carry ground truth.
+	// False means jobs were not observable — GitHub has no org-level jobs API,
+	// so an org-scoped pool reports runners only — and the tracked job state
+	// must be left alone rather than treated as disowned by GitHub.
+	JobsObserved bool
 	// Queued and InProgress are the job IDs GitHub currently reports for our
-	// labels.
+	// labels. Meaningful only when JobsObserved is true.
 	Queued     []int64
 	InProgress []int64
 	// LiveRunners is the number of runners registered and online. Offline
@@ -286,49 +291,50 @@ func (a *Autoscaler) observe(ctx context.Context) {
 func (a *Autoscaler) adopt(o Observation) {
 	a.mu.Lock()
 
-	seen := make(map[int64]struct{}, len(o.Queued)+len(o.InProgress))
-	var adopted []int64
+	var adopted, dropped []int64
+	if o.JobsObserved {
+		seen := make(map[int64]struct{}, len(o.Queued)+len(o.InProgress))
 
-	for _, id := range o.Queued {
-		seen[id] = struct{}{}
-		if a.done.Has(id) {
-			continue
-		}
-		if _, tracked := a.inProgress[id]; tracked {
-			continue
-		}
-		if _, tracked := a.queued[id]; !tracked {
-			a.queued[id] = a.now()
-			a.lastBusy = a.now()
-			adopted = append(adopted, id)
-		}
-	}
-	for _, id := range o.InProgress {
-		seen[id] = struct{}{}
-		if a.done.Has(id) {
-			continue
-		}
-		if _, tracked := a.inProgress[id]; !tracked {
-			delete(a.queued, id)
-			a.inProgress[id] = a.now()
-			a.lastBusy = a.now()
-			adopted = append(adopted, id)
-		}
-	}
-
-	// Jobs we still track that GitHub no longer reports have finished without
-	// us seeing the completion. Dropping them here reclaims capacity far
-	// sooner than JobTTL would.
-	cutoff := a.now().Add(-a.opts.IdleCooldown)
-	var dropped []int64
-	for _, m := range []map[int64]time.Time{a.queued, a.inProgress} {
-		for id, at := range m {
-			if _, ok := seen[id]; ok || !at.Before(cutoff) {
+		for _, id := range o.Queued {
+			seen[id] = struct{}{}
+			if a.done.Has(id) {
 				continue
 			}
-			delete(m, id)
-			a.done.Add(id)
-			dropped = append(dropped, id)
+			if _, tracked := a.inProgress[id]; tracked {
+				continue
+			}
+			if _, tracked := a.queued[id]; !tracked {
+				a.queued[id] = a.now()
+				a.lastBusy = a.now()
+				adopted = append(adopted, id)
+			}
+		}
+		for _, id := range o.InProgress {
+			seen[id] = struct{}{}
+			if a.done.Has(id) {
+				continue
+			}
+			if _, tracked := a.inProgress[id]; !tracked {
+				delete(a.queued, id)
+				a.inProgress[id] = a.now()
+				a.lastBusy = a.now()
+				adopted = append(adopted, id)
+			}
+		}
+
+		// Jobs we still track that GitHub no longer reports have finished
+		// without us seeing the completion. Dropping them here reclaims
+		// capacity far sooner than JobTTL would.
+		cutoff := a.now().Add(-a.opts.IdleCooldown)
+		for _, m := range []map[int64]time.Time{a.queued, a.inProgress} {
+			for id, at := range m {
+				if _, ok := seen[id]; ok || !at.Before(cutoff) {
+					continue
+				}
+				delete(m, id)
+				a.done.Add(id)
+				dropped = append(dropped, id)
+			}
 		}
 	}
 

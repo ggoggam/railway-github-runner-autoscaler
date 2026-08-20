@@ -394,7 +394,7 @@ func TestNoRecycleOnPartialShortfall(t *testing.T) {
 	a, fb, clock := newTestAutoscaler(t, opts, 3)
 
 	obs := &fakeObserver{}
-	obs.set(Observation{LiveRunners: 1, InProgress: []int64{1, 2, 3}})
+	obs.set(Observation{JobsObserved: true, LiveRunners: 1, InProgress: []int64{1, 2, 3}})
 	a.SetObserver(obs)
 
 	*clock = clock.Add(opts.RunnerGrace * 10)
@@ -413,7 +413,7 @@ func TestAdoptsQueuedJobsMissedByWebhooks(t *testing.T) {
 	a, fb, _ := newTestAutoscaler(t, testOptions(), 1)
 
 	obs := &fakeObserver{}
-	obs.set(Observation{Queued: []int64{7, 8, 9}, LiveRunners: 1})
+	obs.set(Observation{JobsObserved: true, Queued: []int64{7, 8, 9}, LiveRunners: 1})
 	a.SetObserver(obs)
 
 	a.reconcile(t.Context())
@@ -433,7 +433,7 @@ func TestDropsJobsGitHubNoLongerReports(t *testing.T) {
 
 	a.OnQueued(1)
 	obs := &fakeObserver{}
-	obs.set(Observation{LiveRunners: 1}) // GitHub says nothing is outstanding
+	obs.set(Observation{JobsObserved: true, LiveRunners: 1}) // GitHub says nothing is outstanding
 	a.SetObserver(obs)
 
 	// Fresh jobs are held: the API can lag a webhook we just accepted.
@@ -446,6 +446,30 @@ func TestDropsJobsGitHubNoLongerReports(t *testing.T) {
 	a.reconcile(t.Context())
 	if s := a.Stats(); s.Queued != 0 {
 		t.Fatalf("want the stale job dropped once GitHub disowns it, got %d queued", s.Queued)
+	}
+}
+
+// An org-scoped observer reports runners but cannot see jobs (GitHub has no
+// org-level jobs API). Such an observation must never be read as "GitHub
+// disowned every tracked job" — that would drop real webhook-driven work.
+func TestRunnerOnlyObservationLeavesTrackedJobsAlone(t *testing.T) {
+	opts := testOptions()
+	a, _, clock := newTestAutoscaler(t, opts, 2)
+
+	a.OnQueued(1)
+	a.OnInProgress(2)
+	obs := &fakeObserver{}
+	obs.set(Observation{LiveRunners: 1}) // JobsObserved false: runners only
+
+	a.SetObserver(obs)
+	*clock = clock.Add(opts.IdleCooldown * 10)
+	a.reconcile(t.Context())
+
+	if s := a.Stats(); s.Queued != 1 || s.InProgress != 1 {
+		t.Fatalf("want webhook-tracked jobs retained, got queued=%d inProgress=%d", s.Queued, s.InProgress)
+	}
+	if s := a.Stats(); s.LiveRunners != 1 {
+		t.Fatalf("want runner liveness still adopted, got %d", s.LiveRunners)
 	}
 }
 
