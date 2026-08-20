@@ -27,6 +27,14 @@ run = "docker build -t railway-github-runner-autoscaler:latest ."
 description = "Run the test suite"
 run = "go test -race -count=1 ./..."
 
+[tasks."test:coverage"]
+description = "Run the test suite with coverage"
+run = "go test -race -count=1 -coverprofile=coverage.out ./..."
+
+[tasks."test:coverage-summary"]
+description = "Run the coverage summary"
+run = "go tool cover -func=coverage.out | tail -1"
+
 [tasks.lint]
 description = "Run golangci-lint"
 run = "golangci-lint run"
