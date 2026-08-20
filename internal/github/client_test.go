@@ -95,7 +95,7 @@ func TestListRunnersReportsStatusAndLabels(t *testing.T) {
 }
 
 // An org-scoped client reads the org-level registrations, which is where
-// runners registered with RUNNER_SCOPE=org appear.
+// runners registered with GITHUB_RUNNER_SCOPE=org appear.
 func TestOrgClientListsOrgRunners(t *testing.T) {
 	c, seen := newTestClient(t, map[string]string{
 		"/orgs/acme/actions/runners": `{
@@ -190,7 +190,7 @@ func TestUnauthorizedErrorMentionsTokenAndRateLimit(t *testing.T) {
 	if err == nil {
 		t.Fatal("want an error on 403")
 	}
-	for _, want := range []string{"GITHUB_API_TOKEN", "rate limit remaining", "403"} {
+	for _, want := range []string{"GITHUB_ACCESS_TOKEN", "rate limit remaining", "403"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error %q missing %q", err, want)
 		}

@@ -77,7 +77,7 @@ The runner service is addressed by **name**, not ID:
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `RAILWAY_RUNNER_SERVICE_NAME` | `Runner` | Name of the runner service to scale, resolved against `RAILWAY_PROJECT_ID` at startup. An exact match wins; a single case-insensitive match is accepted; two matches are a startup error rather than a coin flip. |
+| `RAILWAY_RUNNER_SERVICE_NAME` | `github-runner` | Name of the runner service to scale, resolved against `RAILWAY_PROJECT_ID` at startup. An exact match wins; a single case-insensitive match is accepted; two matches are a startup error rather than a coin flip. |
 | `RAILWAY_RUNNER_SERVICE_ID` | unset | Explicit service ID. Skips the name lookup entirely, and makes `RAILWAY_PROJECT_ID` unnecessary. |
 
 A service ID does not exist until a template is deployed, which is why the name
@@ -89,24 +89,24 @@ Optional:
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `RUNNER_LABELS` | `self-hosted,railway` | A job is counted only if it requests **every** one of these labels. |
+| `GITHUB_RUNNER_LABELS` | `self-hosted,railway` | A job is counted only if it requests **every** one of these labels. Must match `LABELS` on the runner service. |
 | `MAX_RUNNERS` | `3` | Upper bound on replicas. |
-| `MIN_REPLICAS` | `1` | Replicas kept warm while idle. `0` scales to zero (cheaper, slower first job). |
+| `MIN_REPLICAS` | `0` | Replicas kept warm while idle. `0` scales to zero: nothing to pay while idle, a cold start on the first job. Raise it to keep a runner warm. |
 | `IDLE_COOLDOWN` | `60s` | Quiet period required before shrinking the pool. |
 | `STARTUP_GRACE` | `5m` | After a restart, hold existing replicas this long before any scale-down. |
 | `JOB_TTL` | `6h` | Forget jobs whose completion webhook never arrived. |
 | `RESYNC_PERIOD` | `30s` | How often to reconcile against GitHub, retry failed scales, and expire stale jobs. |
-| `GITHUB_API_TOKEN` | unset | Enables reconciliation against GitHub (see below). Repo scope needs `repo`, or fine-grained **Administration: read** + **Actions: read**; org scope needs `admin:org`, or fine-grained organization **Self-hosted runners: read**. Pairs with exactly one of `GITHUB_API_REPOSITORY` or `GITHUB_API_ORGANIZATION`. Sharing one PAT with the runner service needs the corresponding **write** permission, since registering a runner is a write. |
-| `GITHUB_API_REPOSITORY` | unset | `owner/repo` to reconcile against, for repo-scoped runners. Setting it without `GITHUB_API_TOKEN` (or vice versa) is a startup error. |
-| `GITHUB_API_ORGANIZATION` | unset | Organization to reconcile against instead, for [org-scoped runners](#org-scoped-runners). Mutually exclusive with `GITHUB_API_REPOSITORY`. |
-| `RUNNER_GRACE` | `3m` | How long the pool may report replicas but no live runner before those replicas are recycled. Ignored without `GITHUB_API_TOKEN`. |
+| `GITHUB_RUNNER_SCOPE` | `repo` | Where the runners register: `repo` or `org`. Must match `RUNNER_SCOPE` on the runner service, and decides how `GITHUB_API_REPOSITORY` is read. |
+| `GITHUB_ACCESS_TOKEN` | unset | Enables reconciliation against GitHub (see below). Repo scope needs `repo`, or fine-grained **Administration: read** + **Actions: read**; org scope needs `admin:org`, or fine-grained organization **Self-hosted runners: read**. Pairs with `GITHUB_API_REPOSITORY`. Sharing one PAT with the runner service needs the corresponding **write** permission, since registering a runner is a write. |
+| `GITHUB_API_REPOSITORY` | unset | What to reconcile against: `owner/repo` at `GITHUB_RUNNER_SCOPE=repo`, a bare organization name at [`org`](#org-scoped-runners). Setting it without `GITHUB_ACCESS_TOKEN` (or vice versa) is a startup error, as is a value whose shape contradicts the scope. |
+| `RUNNER_GRACE` | `3m` | How long the pool may report replicas but no live runner before those replicas are recycled. Ignored without `GITHUB_ACCESS_TOKEN`. |
 | `GITHUB_API_ENDPOINT` | GitHub public API | Override the REST endpoint (tests, GHES). |
 | `RAILWAY_RUNNER_REGION` | discovered | Pin the region instead of reading it from the service. |
 | `RAILWAY_API_URL` | Railway public API | Override the GraphQL endpoint (tests, proxies). |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error`. |
 | `PORT` | `8080` | Listen port. |
 
-The GitHub variables are deliberately **not** named `GITHUB_TOKEN`, `GITHUB_REPOSITORY`, or `GITHUB_API_URL`. GitHub Actions injects all three into every workflow step, so reading those names would mean any Actions context silently supplies half a configuration.
+The GitHub-facing names mirror [`myoung34/github-runner`](https://github.com/myoung34/docker-github-actions-runner/wiki/Usage) under a `GITHUB_` prefix — `GITHUB_ACCESS_TOKEN` for its `ACCESS_TOKEN`, `GITHUB_RUNNER_SCOPE` for `RUNNER_SCOPE`, `GITHUB_RUNNER_LABELS` for `LABELS` — so one value configures both services. The exceptions are `GITHUB_TOKEN`, `GITHUB_REPOSITORY`, and `GITHUB_API_URL`: GitHub Actions injects all three into every workflow step, so reading those names would mean any Actions context silently supplies half a configuration.
 
 > **Run exactly one replica of the autoscaler.** Job state is in memory; a second replica would scale against its own partial view.
 
@@ -127,13 +127,14 @@ jobs:
     runs-on: [self-hosted, railway]
 ```
 
-The labels must match `RUNNER_LABELS`.
+The labels must match `GITHUB_RUNNER_LABELS`.
 
 ## Railway template
 
 The [template](https://railway.com/template/REPLACE_WITH_TEMPLATE_CODE) deploys
-both services already connected: this autoscaler, and a `Runner` service running
-`myoung34/github-runner` with the restart policy an ephemeral runner needs. The
+both services already connected: this autoscaler, and a `github-runner` service
+running `myoung34/github-runner` with the restart policy an ephemeral runner
+needs. The
 webhook secret is generated for you, and the runner reads the GitHub token, repo,
 and labels from the autoscaler by reference, so each is entered once.
 
@@ -174,7 +175,7 @@ Webhooks alone are not enough to stay correct, because both of the ways they fai
 - **A delivery is lost.** GitHub does not retry a failed webhook. If the autoscaler is redeploying when a `queued` event fires, that job is invisible forever and the pool never grows to meet it.
 - **A replica stops holding a live runner.** Replica count is a proxy for capacity, and it stops being true the moment a runner exits without its container being rebuilt. `applied == desired`, so every reconcile is a no-op, and the pool serves nothing indefinitely.
 
-Setting `GITHUB_API_TOKEN` and `GITHUB_API_REPOSITORY` adds a second, authoritative input. Each resync the autoscaler reads the repository's live runners and its queued and in-progress jobs, then:
+Setting `GITHUB_ACCESS_TOKEN` and `GITHUB_API_REPOSITORY` adds a second, authoritative input. Each resync the autoscaler reads the repository's live runners and its queued and in-progress jobs, then:
 
 - **adopts** jobs GitHub reports that it never saw, which is what makes a lost `queued` delivery recoverable;
 - **drops** tracked jobs GitHub no longer reports, reclaiming capacity far sooner than `JOB_TTL` would;
@@ -188,8 +189,8 @@ Observation is a correction, not a dependency. If GitHub is unreachable the auto
 
 Runners can register against a single repository or against a whole organization. The autoscaler supports both; repo scope is the default. To run org-scoped:
 
-1. **Autoscaler**: set `GITHUB_API_ORGANIZATION=<org>` instead of `GITHUB_API_REPOSITORY`. The PAT then needs `admin:org` (classic) or the fine-grained organization **Self-hosted runners** permission — **read** for the autoscaler alone, **read and write** if the runner service shares it to register.
-2. **Runner service** (`myoung34/github-runner`): set `RUNNER_SCOPE=org` and `ORG_NAME=<org>`, and remove `REPO_URL`.
+1. **Autoscaler**: set `GITHUB_RUNNER_SCOPE=org` and put the bare organization name in `GITHUB_API_REPOSITORY` (instead of `owner/repo`). The PAT then needs `admin:org` (classic) or the fine-grained organization **Self-hosted runners** permission — **read** for the autoscaler alone, **read and write** if the runner service shares it to register.
+2. **`github-runner` service**: set `RUNNER_SCOPE=org` and `ORG_NAME=<org>`. `REPO_URL` is ignored at org scope, so the template's wiring can stay in place.
 3. **Webhook**: add it at the organization level (**Org Settings → Webhooks**), so `workflow_job` events from every repo in the org reach the autoscaler. A repo-level webhook only feeds it that one repo's jobs.
 
 One caveat: GitHub has no org-level API for listing queued jobs (workflow runs live on repositories, and sweeping every repo in an org each resync would burn the rate limit). At org scope the autoscaler therefore reconciles **runner liveness** — dead-pool detection and recycling still work — while job state stays webhook-driven, protected by the `JOB_TTL` and idle-cooldown safety nets. A lost `queued` webhook is adopted on the next resync at repo scope, but not at org scope — there the job waits for a warm runner (`MIN_REPLICAS > 0`) or for a runner freed up by other matching jobs.
@@ -204,7 +205,7 @@ One caveat: GitHub has no org-level API for listing queued jobs (workflow runs l
 - **Handle out-of-order webhooks.** A late `in_progress` for a finished job used to resurrect it permanently. Terminal jobs are now remembered.
 - **Dedupe redelivered webhooks** via `X-GitHub-Delivery`; GitHub retries deliveries.
 - **Retry failed scales.** Upstream returned 500 and relied on GitHub redelivering. Reconciliation is now asynchronous and self-healing.
-- **Reconcile against GitHub.** In-memory state drifts from reality whenever a webhook is lost or a replica stops holding a live runner, and neither is recoverable from in-memory state alone — both make the autoscaler believe it is already where it wants to be. With a `GITHUB_API_TOKEN` the resync loop now reads live runners and outstanding jobs, and recycles a pool that has replicas but nothing running behind them.
+- **Reconcile against GitHub.** In-memory state drifts from reality whenever a webhook is lost or a replica stops holding a live runner, and neither is recoverable from in-memory state alone — both make the autoscaler believe it is already where it wants to be. With a `GITHUB_ACCESS_TOKEN` the resync loop now reads live runners and outstanding jobs, and recycles a pool that has replicas but nothing running behind them.
 
 ### Railway API
 
