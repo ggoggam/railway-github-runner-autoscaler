@@ -34,8 +34,8 @@ func (b *railwayBackend) SetReplicas(ctx context.Context, n int) error {
 	return b.client.SetReplicas(ctx, b.serviceID, b.envID, b.regions, n)
 }
 
-// githubObserver reads the repository's outstanding jobs and live runners,
-// filtered to the labels this pool serves.
+// githubObserver reads the pool's live runners — and, at repo scope, its
+// outstanding jobs — filtered to the labels this pool serves.
 type githubObserver struct {
 	client *github.Client
 	labels []string
@@ -56,10 +56,18 @@ func (o *githubObserver) Observe(ctx context.Context) (scaler.Observation, error
 		}
 	}
 
+	// Workflow runs live on repositories and GitHub has no org-level jobs
+	// API, so at org scope job state stays webhook-driven and only runner
+	// liveness is reconciled.
+	if o.client.OrgScoped() {
+		return obs, nil
+	}
+
 	jobs, err := o.client.ListActiveJobs(ctx)
 	if err != nil {
 		return obs, fmt.Errorf("list active jobs: %w", err)
 	}
+	obs.JobsObserved = true
 	for _, j := range jobs {
 		if !webhook.MatchesLabels(j.Labels, o.labels) {
 			continue
@@ -164,11 +172,18 @@ func run(logger *slog.Logger) error {
 	// Optional: without a GitHub credential the autoscaler stays webhook-only,
 	// which is how it behaved before and remains a valid way to run it.
 	if cfg.GitHubToken != "" {
-		owner, repo, err := github.SplitRepository(cfg.Repository)
-		if err != nil {
-			return err
+		var gh *github.Client
+		if cfg.Organization != "" {
+			gh = github.NewOrgClient(cfg.GitHubToken, cfg.Organization, logger)
+			logger.Info("org scope: reconciling runner liveness only; job state stays webhook-driven",
+				"organization", cfg.Organization)
+		} else {
+			owner, repo, err := github.SplitRepository(cfg.Repository)
+			if err != nil {
+				return err
+			}
+			gh = github.NewClient(cfg.GitHubToken, owner, repo, logger)
 		}
-		gh := github.NewClient(cfg.GitHubToken, owner, repo, logger)
 		gh.Endpoint = cfg.GitHubAPIURL
 		auto.SetObserver(&githubObserver{client: gh, labels: cfg.RunnerLabels})
 	}
@@ -207,6 +222,7 @@ func run(logger *slog.Logger) error {
 		"runnerGrace", cfg.RunnerGrace,
 		"githubReconcile", cfg.GitHubToken != "",
 		"repository", cfg.Repository,
+		"organization", cfg.Organization,
 		"baselineReplicas", state.Replicas,
 	)
 

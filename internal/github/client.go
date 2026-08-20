@@ -33,11 +33,15 @@ const (
 	maxRunPages = 3
 )
 
-// Client talks to GitHub's REST API for a single repository.
+// Client talks to GitHub's REST API for a single repository or organization.
 type Client struct {
-	Token    string
-	Owner    string
-	Repo     string
+	Token string
+	// Owner and Repo identify the repository at repo scope. Empty at org scope.
+	Owner string
+	Repo  string
+	// Org identifies the organization at org scope; non-empty means the
+	// client reads the org-level runner registrations instead of a repo's.
+	Org      string
 	Endpoint string
 	HTTP     *http.Client
 	Logger   *slog.Logger
@@ -54,6 +58,20 @@ func NewClient(token, owner, repo string, logger *slog.Logger) *Client {
 		Logger:   logger,
 	}
 }
+
+// NewOrgClient returns a Client scoped to an organization's runner pool.
+func NewOrgClient(token, org string, logger *slog.Logger) *Client {
+	return &Client{
+		Token:    token,
+		Org:      org,
+		Endpoint: DefaultEndpoint,
+		HTTP:     &http.Client{Timeout: 30 * time.Second},
+		Logger:   logger,
+	}
+}
+
+// OrgScoped reports whether the client reads org-level registrations.
+func (c *Client) OrgScoped() bool { return c.Org != "" }
 
 // SplitRepository splits an "owner/repo" string.
 func SplitRepository(s string) (owner, repo string, err error) {
@@ -87,7 +105,7 @@ func (c *Client) get(ctx context.Context, path string, query url.Values, out any
 	if err != nil {
 		return fmt.Errorf("github api transport: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxRespBodyRead))
 	if err != nil {
@@ -98,7 +116,7 @@ func (c *Client) get(ctx context.Context, path string, query url.Values, out any
 	case resp.StatusCode == http.StatusUnauthorized, resp.StatusCode == http.StatusForbidden:
 		// 403 is also how GitHub reports a spent rate limit; surface the
 		// remaining quota so the cause is obvious from the log line.
-		return fmt.Errorf("github api %d (check GITHUB_TOKEN scopes; rate limit remaining %q): %s",
+		return fmt.Errorf("github api %d (check GITHUB_API_TOKEN scopes; rate limit remaining %q): %s",
 			resp.StatusCode, resp.Header.Get("X-RateLimit-Remaining"), truncate(body, 200))
 	case resp.StatusCode != http.StatusOK:
 		return fmt.Errorf("github api %d: %s", resp.StatusCode, truncate(body, 200))
@@ -143,9 +161,13 @@ type runnersResponse struct {
 // dies without deregistering is still listed, with status "offline". Callers
 // that want capacity must count only online runners.
 func (c *Client) ListRunners(ctx context.Context) ([]Runner, error) {
+	path := fmt.Sprintf("/repos/%s/%s/actions/runners", c.Owner, c.Repo)
+	if c.OrgScoped() {
+		path = fmt.Sprintf("/orgs/%s/actions/runners", c.Org)
+	}
+
 	var resp runnersResponse
-	err := c.get(ctx, fmt.Sprintf("/repos/%s/%s/actions/runners", c.Owner, c.Repo),
-		url.Values{"per_page": {strconv.Itoa(perPage)}}, &resp)
+	err := c.get(ctx, path, url.Values{"per_page": {strconv.Itoa(perPage)}}, &resp)
 	if err != nil {
 		return nil, err
 	}
@@ -190,7 +212,13 @@ type jobsResponse struct {
 // walks the unfinished workflow runs and reads each one's jobs. Runs are
 // fetched per status because the runs endpoint accepts only a single status
 // filter.
+//
+// Repo scope only: workflow runs live on repositories, and GitHub has no
+// org-level equivalent, so an org-scoped client cannot enumerate jobs.
 func (c *Client) ListActiveJobs(ctx context.Context) ([]Job, error) {
+	if c.OrgScoped() {
+		return nil, fmt.Errorf("org scope: GitHub has no org-level jobs API")
+	}
 	runIDs, err := c.activeRunIDs(ctx)
 	if err != nil {
 		return nil, err

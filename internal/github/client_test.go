@@ -94,6 +94,41 @@ func TestListRunnersReportsStatusAndLabels(t *testing.T) {
 	}
 }
 
+// An org-scoped client reads the org-level registrations, which is where
+// runners registered with RUNNER_SCOPE=org appear.
+func TestOrgClientListsOrgRunners(t *testing.T) {
+	c, seen := newTestClient(t, map[string]string{
+		"/orgs/acme/actions/runners": `{
+			"total_count": 1,
+			"runners": [{"id": 1, "name": "org-runner", "status": "online", "busy": false,
+			             "labels": [{"name": "self-hosted"}, {"name": "railway"}]}]
+		}`,
+	})
+	c.Owner, c.Repo, c.Org = "", "", "acme"
+
+	runners, err := c.ListRunners(t.Context())
+	if err != nil {
+		t.Fatalf("ListRunners: %v", err)
+	}
+	if len(runners) != 1 || !runners[0].Online() {
+		t.Fatalf("want the org runner, got %+v", runners)
+	}
+	for _, s := range *seen {
+		if strings.Contains(s, "/repos/") {
+			t.Errorf("org scope must not touch repo endpoints, saw %q", s)
+		}
+	}
+}
+
+// Workflow runs live on repositories; asking an org-scoped client for jobs is
+// a programming error and must fail loudly rather than return an empty view.
+func TestOrgClientRefusesToListJobs(t *testing.T) {
+	c := NewOrgClient("tok", "acme", discardLogger())
+	if _, err := c.ListActiveJobs(t.Context()); err == nil {
+		t.Fatal("want an error at org scope, got none")
+	}
+}
+
 func TestListActiveJobsWalksUnfinishedRuns(t *testing.T) {
 	c, seen := newTestClient(t, map[string]string{
 		"/repos/acme/widgets/actions/runs": `{
@@ -155,7 +190,7 @@ func TestUnauthorizedErrorMentionsTokenAndRateLimit(t *testing.T) {
 	if err == nil {
 		t.Fatal("want an error on 403")
 	}
-	for _, want := range []string{"GITHUB_TOKEN", "rate limit remaining", "403"} {
+	for _, want := range []string{"GITHUB_API_TOKEN", "rate limit remaining", "403"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error %q missing %q", err, want)
 		}

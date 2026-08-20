@@ -96,8 +96,9 @@ Optional:
 | `STARTUP_GRACE` | `5m` | After a restart, hold existing replicas this long before any scale-down. |
 | `JOB_TTL` | `6h` | Forget jobs whose completion webhook never arrived. |
 | `RESYNC_PERIOD` | `30s` | How often to reconcile against GitHub, retry failed scales, and expire stale jobs. |
-| `GITHUB_API_TOKEN` | unset | Enables reconciliation against GitHub (see below). Needs `repo` scope, or fine-grained **Administration: read** + **Actions: read**. Pairs with `GITHUB_API_REPOSITORY`. Sharing one PAT with the runner service needs **Administration: read and write**, since registering a runner is a write. |
-| `GITHUB_API_REPOSITORY` | unset | `owner/repo` to reconcile against. Required with `GITHUB_API_TOKEN`; setting one without the other is a startup error. |
+| `GITHUB_API_TOKEN` | unset | Enables reconciliation against GitHub (see below). Repo scope needs `repo`, or fine-grained **Administration: read** + **Actions: read**; org scope needs `admin:org`, or fine-grained organization **Self-hosted runners: read**. Pairs with exactly one of `GITHUB_API_REPOSITORY` or `GITHUB_API_ORGANIZATION`. Sharing one PAT with the runner service needs the corresponding **write** permission, since registering a runner is a write. |
+| `GITHUB_API_REPOSITORY` | unset | `owner/repo` to reconcile against, for repo-scoped runners. Setting it without `GITHUB_API_TOKEN` (or vice versa) is a startup error. |
+| `GITHUB_API_ORGANIZATION` | unset | Organization to reconcile against instead, for [org-scoped runners](#org-scoped-runners). Mutually exclusive with `GITHUB_API_REPOSITORY`. |
 | `RUNNER_GRACE` | `3m` | How long the pool may report replicas but no live runner before those replicas are recycled. Ignored without `GITHUB_API_TOKEN`. |
 | `GITHUB_API_ENDPOINT` | GitHub public API | Override the REST endpoint (tests, GHES). |
 | `RAILWAY_RUNNER_REGION` | discovered | Pin the region instead of reading it from the service. |
@@ -182,6 +183,16 @@ Setting `GITHUB_API_TOKEN` and `GITHUB_API_REPOSITORY` adds a second, authoritat
 The recycle condition is deliberately narrow. Only a total outage qualifies: with zero live runners nothing can be executing, so tearing the replicas down cannot kill a running job. A partial shortfall is left alone precisely because it is indistinguishable from a runner that is mid-job.
 
 Observation is a correction, not a dependency. If GitHub is unreachable the autoscaler logs a warning and keeps scaling on webhooks alone, and without a token it behaves exactly as it did before.
+
+## Org-scoped runners
+
+Runners can register against a single repository or against a whole organization. The autoscaler supports both; repo scope is the default. To run org-scoped:
+
+1. **Autoscaler**: set `GITHUB_API_ORGANIZATION=<org>` instead of `GITHUB_API_REPOSITORY`. The PAT then needs `admin:org` (classic) or the fine-grained organization **Self-hosted runners** permission — **read** for the autoscaler alone, **read and write** if the runner service shares it to register.
+2. **Runner service** (`myoung34/github-runner`): set `RUNNER_SCOPE=org` and `ORG_NAME=<org>`, and remove `REPO_URL`.
+3. **Webhook**: add it at the organization level (**Org Settings → Webhooks**), so `workflow_job` events from every repo in the org reach the autoscaler. A repo-level webhook only feeds it that one repo's jobs.
+
+One caveat: GitHub has no org-level API for listing queued jobs (workflow runs live on repositories, and sweeping every repo in an org each resync would burn the rate limit). At org scope the autoscaler therefore reconciles **runner liveness** — dead-pool detection and recycling still work — while job state stays webhook-driven, protected by the `JOB_TTL` and idle-cooldown safety nets. A lost `queued` webhook is adopted on the next resync at repo scope, but not at org scope — there the job waits for a warm runner (`MIN_REPLICAS > 0`) or for a runner freed up by other matching jobs.
 
 ## What changed from upstream
 

@@ -9,33 +9,23 @@ permissions:
   contents: read
 
 jobs:
-  test:
+  ci:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
 
-      - uses: actions/setup-go@v6
+      - uses: jdx/mise-action@v4
         with:
-          go-version: '1.26'
           cache: true
 
-      - name: Verify formatting
-        run: |
-          unformatted=$(gofmt -l .)
-          if [ -n "$unformatted" ]; then
-            echo "These files need gofmt:"
-            echo "$unformatted"
-            exit 1
-          fi
-
-      - name: Vet
-        run: go vet ./...
+      - name: Pre-commit
+        run: mise run pre-commit
 
       - name: Test
-        run: go test -race -count=1 -coverprofile=coverage.out ./...
+        run: mise run test:coverage
 
       - name: Coverage summary
-        run: go tool cover -func=coverage.out | tail -1
+        run: mise run test:coverage-summary
 
   docker:
     runs-on: ubuntu-latest

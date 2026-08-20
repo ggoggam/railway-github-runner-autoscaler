@@ -1,11 +1,11 @@
 package config
 
 import (
-	"github.com/ggoggam/railway-github-runner-autoscaler/internal/github"
 	"reflect"
 	"testing"
 	"time"
 
+	"github.com/ggoggam/railway-github-runner-autoscaler/internal/github"
 	"github.com/ggoggam/railway-github-runner-autoscaler/internal/railway"
 )
 
@@ -152,14 +152,22 @@ func TestNormalizeLabels(t *testing.T) {
 	}
 }
 
-// Reconciling against GitHub needs both a credential and a repository. Taking
-// one without the other would quietly leave the autoscaler webhook-only, which
-// is the failure mode this feature exists to remove.
-func TestGitHubReconcileRequiresBothTokenAndRepository(t *testing.T) {
+// Reconciling against GitHub needs a credential plus exactly one scope —
+// repository or organization. A partial configuration would quietly leave the
+// autoscaler webhook-only, which is the failure mode this feature exists to
+// remove; both scopes at once would leave which pool to watch ambiguous.
+func TestGitHubReconcileRequiresTokenAndExactlyOneScope(t *testing.T) {
 	for name, env := range map[string]map[string]string{
-		"token without repository": {"GITHUB_API_TOKEN": "ghp_x"},
-		"repository without token": {"GITHUB_API_REPOSITORY": "acme/widgets"},
-		"malformed repository":     {"GITHUB_API_TOKEN": "ghp_x", "GITHUB_REPOSITORY": "acme"},
+		"token without repository or org": {"GITHUB_API_TOKEN": "ghp_x"},
+		"repository without token":        {"GITHUB_API_REPOSITORY": "acme/widgets"},
+		"organization without token":      {"GITHUB_API_ORGANIZATION": "acme"},
+		"malformed repository":            {"GITHUB_API_TOKEN": "ghp_x", "GITHUB_REPOSITORY": "acme"},
+		"org with a slash":                {"GITHUB_API_TOKEN": "ghp_x", "GITHUB_API_ORGANIZATION": "acme/widgets"},
+		"both repository and org": {
+			"GITHUB_API_TOKEN":        "ghp_x",
+			"GITHUB_API_REPOSITORY":   "acme/widgets",
+			"GITHUB_API_ORGANIZATION": "acme",
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			setRequiredEnv(t)
@@ -206,6 +214,25 @@ func TestGitHubReconcileEnabled(t *testing.T) {
 	}
 	if cfg.ScalerOptions().RunnerGrace != 90*time.Second {
 		t.Fatalf("got RunnerGrace %v", cfg.ScalerOptions().RunnerGrace)
+	}
+}
+
+// Runners can be registered against an organization instead of a single
+// repository; the autoscaler must accept that scope too.
+func TestGitHubReconcileEnabledAtOrgScope(t *testing.T) {
+	setRequiredEnv(t)
+	t.Setenv("GITHUB_API_TOKEN", "ghp_x")
+	t.Setenv("GITHUB_API_ORGANIZATION", " acme ")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Organization != "acme" {
+		t.Fatalf("got organization %q", cfg.Organization)
+	}
+	if cfg.Repository != "" {
+		t.Fatalf("want no repository at org scope, got %q", cfg.Repository)
 	}
 }
 

@@ -47,6 +47,8 @@ The labels must match `RUNNER_LABELS`. `GET /status` on the autoscaler reports c
 
 Two things worth knowing. Run exactly one replica of the Autoscaler — job state is held in memory, so a second replica would scale against its own partial view. And `MIN_REPLICAS` defaults to `0`, which costs nothing while idle at the price of a cold start on the first job; raise it to keep a runner warm.
 
+The template deploys repo-scoped runners. To serve a whole organization instead, swap `GITHUB_API_REPOSITORY` for `GITHUB_API_ORGANIZATION` on the Autoscaler, set `RUNNER_SCOPE=org` and `ORG_NAME` on the Runner, and add the webhook at the org level — details in the [configuration reference](https://github.com/ggoggam/railway-github-runner-autoscaler#org-scoped-runners).
+
 ## Why Deploy autoscaled-github-actions-runner on Railway?
 
 Railway is a singular platform to deploy your infrastructure stack. Railway will host your infrastructure so you don't have to deal with configuration, while allowing you to vertically and horizontally scale it.

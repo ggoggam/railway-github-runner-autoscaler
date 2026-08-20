@@ -1,0 +1,63 @@
+# Standalone project (not a workspace config_root), so tool versions are pinned literally
+# here rather than templated from a monorepo-root [vars] table. Keep go in step with the
+# Dockerfile's golang image and .github/workflows/ci.yml's setup-go pin — neither reads mise.
+
+[tools]
+go = "1.26"
+golangci-lint = "2.12.2"
+prek = "latest"
+
+# ── Build / run ───────────────────────────────────────────────────────────────
+
+[tasks.build]
+description = "Build the autoscaler binary"
+run = "go build -o autoscaler ./cmd/autoscaler"
+
+[tasks.run]
+description = "Run the autoscaler"
+run = "go run ./cmd/autoscaler"
+
+[tasks."docker:build"]
+description = "Build the autoscaler Docker image"
+run = "docker build -t railway-github-runner-autoscaler:latest ."
+
+# ── Quality ───────────────────────────────────────────────────────────────────
+
+[tasks.test]
+description = "Run the test suite"
+run = "go test -race -count=1 ./..."
+
+[tasks."test:coverage"]
+description = "Run the test suite with coverage"
+run = "go test -race -count=1 -coverprofile=coverage.out ./..."
+
+[tasks."test:coverage-summary"]
+description = "Run the coverage summary"
+run = "go tool cover -func=coverage.out | tail -1"
+
+[tasks.lint]
+description = "Run golangci-lint"
+run = "golangci-lint run"
+
+[tasks.fmt]
+description = "Format Go code"
+run = "go fmt ./..."
+
+[tasks."fmt:check"]
+description = "Fail if any Go file needs gofmt"
+run = '''
+files=$(gofmt -l .)
+if [ -n "$files" ]; then
+  echo "gofmt needed on:"
+  echo "$files"
+  exit 1
+fi
+'''
+
+[tasks.check]
+description = "Full check suite: lint + test"
+depends = ["lint", "test"]
+
+[tasks."pre-commit"]
+description = "Run pre-commit checks via prek"
+run = "prek run --show-diff-on-failure --color=always --all-files --hook-stage=manual"
