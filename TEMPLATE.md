@@ -12,7 +12,7 @@ Deploying users need only the [README](README.md).
 
 The autoscaler is half the system. On its own it scales nothing, and the service
 it scales has three settings that are easy to get wrong and silent when wrong
-(see [Runner](#service-2-runner)). A template that shipped only the autoscaler
+(see [github-runner](#service-2-github-runner)). A template that shipped only the autoscaler
 would leave every user hand-building the one service whose misconfiguration is
 the most common failure in this whole design. Both services belong in the
 template.
@@ -49,7 +49,7 @@ webhook secret itself — the template does.
 | `GITHUB_API_REPOSITORY` | *(empty — user supplies)* | What the runners serve: the repository as `owner/repo`, or a bare organization name if `GITHUB_RUNNER_SCOPE` is `org`. |
 | `GITHUB_RUNNER_SCOPE` | `repo` | `repo` or `org`. Both services read this one value, so switching scope is a single edit. |
 | `GITHUB_WEBHOOK_SECRET` | `${{secret(64, "abcdef0123456789")}}` | Generated for you. Copy it into the GitHub webhook's Secret field. |
-| `RAILWAY_RUNNER_SERVICE_NAME` | `github-runner` | Name of the service to scale. Change it only if you rename the Runner service. |
+| `RAILWAY_RUNNER_SERVICE_NAME` | `github-runner` | Name of the service to scale. Change it only if you rename the github-runner service. |
 | `GITHUB_RUNNER_LABELS` | `self-hosted,railway` | A job is served only if it requests every one of these labels. |
 | `MAX_RUNNERS` | `3` | Upper bound on concurrent runners. |
 | `MIN_REPLICAS` | `0` | Runners kept warm while idle. `0` costs nothing when idle; the first job then waits for a cold start. |
@@ -61,7 +61,7 @@ not add them — an explicit empty value shadows the real one.
 until the template is deployed, so the autoscaler resolves the runner by name
 against the project instead. It stays available as an override.
 
-## Service 2: Runner
+## Service 2: github-runner
 
 | Setting | Value |
 | --- | --- |
@@ -113,7 +113,7 @@ deployed project to serve a whole organization touches one service:
 | Service | Change |
 | --- | --- |
 | Autoscaler | Set `GITHUB_RUNNER_SCOPE` to `org`, and replace `GITHUB_API_REPOSITORY`'s `owner/repo` with the bare org name. |
-| Runner | Nothing — `RUNNER_SCOPE`, `ORG_NAME`, and `REPO_URL` all follow by reference, and the image reads only the pair its scope calls for. |
+| github-runner | Nothing — `RUNNER_SCOPE`, `ORG_NAME`, and `REPO_URL` all follow by reference, and the image reads only the pair its scope calls for. |
 
 The PAT then needs org-runner permissions instead: classic `admin:org`, or
 fine-grained organization **Self-hosted runners: read and write** (write is the
@@ -193,7 +193,7 @@ The labels must match `GITHUB_RUNNER_LABELS`. `GET /status` on the autoscaler re
 
 Two things worth knowing. Run exactly one replica of the Autoscaler — job state is held in memory, so a second replica would scale against its own partial view. And `MIN_REPLICAS` defaults to `0`, which costs nothing while idle at the price of a cold start on the first job; raise it to keep a runner warm.
 
-The template deploys repo-scoped runners. To serve a whole organization instead, set `GITHUB_RUNNER_SCOPE=org` on the Autoscaler and put the organization name in `GITHUB_API_REPOSITORY` (the Runner follows by reference), then add the webhook at the organization level. The [configuration reference](https://github.com/ggoggam/railway-github-runner-autoscaler#org-scoped-runners) covers the details.
+The template deploys repo-scoped runners. To serve a whole organization instead, set `GITHUB_RUNNER_SCOPE=org` on the Autoscaler and put the organization name in `GITHUB_API_REPOSITORY` (the github-runner service follows by reference), then add the webhook at the organization level. The [configuration reference](https://github.com/ggoggam/railway-github-runner-autoscaler#org-scoped-runners) covers the details.
 
 ### Why Deploy autoscaled-github-actions-runner on Railway?
 

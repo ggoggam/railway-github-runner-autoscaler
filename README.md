@@ -190,7 +190,7 @@ Observation is a correction, not a dependency. If GitHub is unreachable the auto
 Runners can register against a single repository or against a whole organization. The autoscaler supports both; repo scope is the default. To run org-scoped:
 
 1. **Autoscaler**: set `GITHUB_RUNNER_SCOPE=org` and put the bare organization name in `GITHUB_API_REPOSITORY` (instead of `owner/repo`). The PAT then needs `admin:org` (classic) or the fine-grained organization **Self-hosted runners** permission — **read** for the autoscaler alone, **read and write** if the runner service shares it to register.
-2. **Runner service** (`myoung34/github-runner`): set `RUNNER_SCOPE=org` and `ORG_NAME=<org>`. `REPO_URL` is ignored at org scope, so the template's wiring can stay in place.
+2. **`github-runner` service**: set `RUNNER_SCOPE=org` and `ORG_NAME=<org>`. `REPO_URL` is ignored at org scope, so the template's wiring can stay in place.
 3. **Webhook**: add it at the organization level (**Org Settings → Webhooks**), so `workflow_job` events from every repo in the org reach the autoscaler. A repo-level webhook only feeds it that one repo's jobs.
 
 One caveat: GitHub has no org-level API for listing queued jobs (workflow runs live on repositories, and sweeping every repo in an org each resync would burn the rate limit). At org scope the autoscaler therefore reconciles **runner liveness** — dead-pool detection and recycling still work — while job state stays webhook-driven, protected by the `JOB_TTL` and idle-cooldown safety nets. A lost `queued` webhook is adopted on the next resync at repo scope, but not at org scope — there the job waits for a warm runner (`MIN_REPLICAS > 0`) or for a runner freed up by other matching jobs.
