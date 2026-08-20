@@ -1,0 +1,32 @@
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+        exclude: '(^LICENSE$|\.bin$)'
+      - id: end-of-file-fixer
+        exclude: '(^LICENSE$|\.bin$)'
+      - id: check-yaml
+      - id: check-toml
+      - id: check-json
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: ["--maxkb=500"]
+
+  - repo: local
+    hooks:
+      - id: go-fmt-check
+        name: go format check
+        entry: mise run fmt:check
+        language: system
+        pass_filenames: false
+        types: [go]
+
+      # golangci-lint's `standard` set includes govet, so there is no separate
+      # go-vet hook — .golangci.yml is the single place linting is configured.
+      - id: go-lint
+        name: go lint (golangci-lint)
+        entry: mise run lint
+        language: system
+        pass_filenames: false
+        types: [go]

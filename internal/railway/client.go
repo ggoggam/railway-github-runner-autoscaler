@@ -144,7 +144,7 @@ func (c *Client) attempt(ctx context.Context, req request, out any) error {
 		// Transport-level failures are worth another go.
 		return &retryable{err: fmt.Errorf("railway api transport: %w", err)}
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxRespBodyRead))
 	if err != nil {

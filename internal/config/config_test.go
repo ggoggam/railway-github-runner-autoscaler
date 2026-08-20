@@ -1,11 +1,11 @@
 package config
 
 import (
-	"github.com/ggoggam/railway-github-runner-autoscaler/internal/github"
 	"reflect"
 	"testing"
 	"time"
 
+	"github.com/ggoggam/railway-github-runner-autoscaler/internal/github"
 	"github.com/ggoggam/railway-github-runner-autoscaler/internal/railway"
 )
 
