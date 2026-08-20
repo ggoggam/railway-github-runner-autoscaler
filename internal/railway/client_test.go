@@ -275,13 +275,13 @@ func servicesResponse(services map[string]string) string {
 func TestResolveServiceIDByName(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(servicesResponse(map[string]string{
-			"Autoscaler": "svc-auto",
-			"Runner":     "svc-runner",
+			"autoscaler":    "svc-auto",
+			"github-runner": "svc-runner",
 		})))
 	}))
 	defer srv.Close()
 
-	got, err := newTestClient(t, srv.URL).ResolveServiceID(t.Context(), "proj", "Runner")
+	got, err := newTestClient(t, srv.URL).ResolveServiceID(t.Context(), "proj", "github-runner")
 	if err != nil {
 		t.Fatalf("ResolveServiceID: %v", err)
 	}
@@ -294,11 +294,11 @@ func TestResolveServiceIDByName(t *testing.T) {
 // lose autoscaling.
 func TestResolveServiceIDMatchesCaseInsensitively(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(servicesResponse(map[string]string{"runner": "svc-runner"})))
+		_, _ = w.Write([]byte(servicesResponse(map[string]string{"GitHub-Runner": "svc-runner"})))
 	}))
 	defer srv.Close()
 
-	got, err := newTestClient(t, srv.URL).ResolveServiceID(t.Context(), "proj", "Runner")
+	got, err := newTestClient(t, srv.URL).ResolveServiceID(t.Context(), "proj", "github-runner")
 	if err != nil {
 		t.Fatalf("ResolveServiceID: %v", err)
 	}
@@ -307,19 +307,19 @@ func TestResolveServiceIDMatchesCaseInsensitively(t *testing.T) {
 	}
 }
 
-// An exact match must win outright, or a project holding both "Runner" and
-// "runner" would resolve by iteration order.
+// An exact match must win outright, or a project holding both "github-runner"
+// and "GitHub-Runner" would resolve by iteration order.
 func TestResolveServiceIDPrefersExactMatch(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(servicesResponse(map[string]string{
-			"Runner": "svc-exact",
-			"runner": "svc-loose",
+			"github-runner": "svc-exact",
+			"GitHub-Runner": "svc-loose",
 		})))
 	}))
 	defer srv.Close()
 
 	for range 20 { // iteration order over the response varies run to run
-		got, err := newTestClient(t, srv.URL).ResolveServiceID(t.Context(), "proj", "Runner")
+		got, err := newTestClient(t, srv.URL).ResolveServiceID(t.Context(), "proj", "github-runner")
 		if err != nil {
 			t.Fatalf("ResolveServiceID: %v", err)
 		}
@@ -333,16 +333,16 @@ func TestResolveServiceIDPrefersExactMatch(t *testing.T) {
 // service at once and the autoscaler may query before the runner is visible.
 func TestResolveServiceIDNotFoundIsDistinguishable(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(servicesResponse(map[string]string{"Autoscaler": "svc-auto"})))
+		_, _ = w.Write([]byte(servicesResponse(map[string]string{"autoscaler": "svc-auto"})))
 	}))
 	defer srv.Close()
 
-	_, err := newTestClient(t, srv.URL).ResolveServiceID(t.Context(), "proj", "Runner")
+	_, err := newTestClient(t, srv.URL).ResolveServiceID(t.Context(), "proj", "github-runner")
 	if !errors.Is(err, ErrServiceNotFound) {
 		t.Fatalf("err = %v, want ErrServiceNotFound", err)
 	}
 	// The names that were present are what tells a user they mistyped one.
-	if !strings.Contains(err.Error(), "Autoscaler") {
+	if !strings.Contains(err.Error(), "autoscaler") {
 		t.Errorf("error should list the services found, got %v", err)
 	}
 }
@@ -351,13 +351,13 @@ func TestResolveServiceIDNotFoundIsDistinguishable(t *testing.T) {
 func TestResolveServiceIDRejectsAmbiguousMatch(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(servicesResponse(map[string]string{
-			"runner": "svc-a",
-			"RUNNER": "svc-b",
+			"github-runner": "svc-a",
+			"GITHUB-RUNNER": "svc-b",
 		})))
 	}))
 	defer srv.Close()
 
-	_, err := newTestClient(t, srv.URL).ResolveServiceID(t.Context(), "proj", "Runner")
+	_, err := newTestClient(t, srv.URL).ResolveServiceID(t.Context(), "proj", "GitHub-Runner")
 	if err == nil {
 		t.Fatal("want error when two services match case-insensitively")
 	}
