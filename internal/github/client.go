@@ -116,7 +116,7 @@ func (c *Client) get(ctx context.Context, path string, query url.Values, out any
 	case resp.StatusCode == http.StatusUnauthorized, resp.StatusCode == http.StatusForbidden:
 		// 403 is also how GitHub reports a spent rate limit; surface the
 		// remaining quota so the cause is obvious from the log line.
-		return fmt.Errorf("github api %d (check GITHUB_API_TOKEN scopes; rate limit remaining %q): %s",
+		return fmt.Errorf("github api %d (check GITHUB_ACCESS_TOKEN scopes; rate limit remaining %q): %s",
 			resp.StatusCode, resp.Header.Get("X-RateLimit-Remaining"), truncate(body, 200))
 	case resp.StatusCode != http.StatusOK:
 		return fmt.Errorf("github api %d: %s", resp.StatusCode, truncate(body, 200))

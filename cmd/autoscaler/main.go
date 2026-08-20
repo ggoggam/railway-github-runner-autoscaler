@@ -173,10 +173,10 @@ func run(logger *slog.Logger) error {
 	// which is how it behaved before and remains a valid way to run it.
 	if cfg.GitHubToken != "" {
 		var gh *github.Client
-		if cfg.Organization != "" {
-			gh = github.NewOrgClient(cfg.GitHubToken, cfg.Organization, logger)
+		if cfg.RunnerScope == config.ScopeOrg {
+			gh = github.NewOrgClient(cfg.GitHubToken, cfg.Repository, logger)
 			logger.Info("org scope: reconciling runner liveness only; job state stays webhook-driven",
-				"organization", cfg.Organization)
+				"organization", cfg.Repository)
 		} else {
 			owner, repo, err := github.SplitRepository(cfg.Repository)
 			if err != nil {
@@ -221,8 +221,8 @@ func run(logger *slog.Logger) error {
 		"jobTTL", cfg.JobTTL,
 		"runnerGrace", cfg.RunnerGrace,
 		"githubReconcile", cfg.GitHubToken != "",
-		"repository", cfg.Repository,
-		"organization", cfg.Organization,
+		"runnerScope", cfg.RunnerScope,
+		"githubTarget", cfg.Repository,
 		"baselineReplicas", state.Replicas,
 	)
 

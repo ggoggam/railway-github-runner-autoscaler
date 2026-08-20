@@ -45,11 +45,12 @@ webhook secret itself — the template does.
 | Variable | Value | Description to show the user |
 | --- | --- | --- |
 | `RAILWAY_API_TOKEN` | *(empty — user supplies)* | A Railway **workspace** token from railway.com/account/tokens. Scoped to one workspace, unlike an account token. Seal it. |
-| `GITHUB_API_TOKEN` | *(empty — user supplies)* | GitHub PAT. Classic: `repo`. Fine-grained: **Administration: read and write** + **Actions: read**. Write is needed because the runner uses this same token to register. Seal it. |
-| `GITHUB_API_REPOSITORY` | *(empty — user supplies)* | The repository whose jobs to serve, as `owner/repo`. |
+| `GITHUB_ACCESS_TOKEN` | *(empty — user supplies)* | GitHub PAT. Classic: `repo`. Fine-grained: **Administration: read and write** + **Actions: read**. Write is needed because the runner uses this same token to register. Seal it. |
+| `GITHUB_API_REPOSITORY` | *(empty — user supplies)* | What the runners serve: the repository as `owner/repo`, or a bare organization name if `GITHUB_RUNNER_SCOPE` is `org`. |
+| `GITHUB_RUNNER_SCOPE` | `repo` | `repo` or `org`. Both services read this one value, so switching scope is a single edit. |
 | `GITHUB_WEBHOOK_SECRET` | `${{secret(64, "abcdef0123456789")}}` | Generated for you. Copy it into the GitHub webhook's Secret field. |
-| `RAILWAY_RUNNER_SERVICE_NAME` | `Runner` | Name of the service to scale. Change it only if you rename the Runner service. |
-| `RUNNER_LABELS` | `self-hosted,railway` | A job is served only if it requests every one of these labels. |
+| `RAILWAY_RUNNER_SERVICE_NAME` | `github-runner` | Name of the service to scale. Change it only if you rename the Runner service. |
+| `GITHUB_RUNNER_LABELS` | `self-hosted,railway` | A job is served only if it requests every one of these labels. |
 | `MAX_RUNNERS` | `3` | Upper bound on concurrent runners. |
 | `MIN_REPLICAS` | `0` | Runners kept warm while idle. `0` costs nothing when idle; the first job then waits for a cold start. |
 
@@ -65,7 +66,7 @@ against the project instead. It stays available as an override.
 | Setting | Value |
 | --- | --- |
 | Source | Docker image `myoung34/github-runner:latest` |
-| Service name | **`Runner`** — this is what `RAILWAY_RUNNER_SERVICE_NAME` resolves |
+| Service name | **`github-runner`** — this is what `RAILWAY_RUNNER_SERVICE_NAME` resolves |
 | Restart policy | **`ALWAYS`** |
 | Restart max retries | **`1000`** |
 | Draining seconds | `300` |
@@ -90,11 +91,12 @@ the replica count the autoscaler just set.
 
 | Variable | Value | Description to show the user |
 | --- | --- | --- |
-| `ACCESS_TOKEN` | `${{Autoscaler.GITHUB_API_TOKEN}}` | Reference — the PAT is entered once, on the Autoscaler. |
-| `REPO_URL` | `https://github.com/${{Autoscaler.GITHUB_API_REPOSITORY}}` | Reference — derived from the repo entered on the Autoscaler. |
-| `LABELS` | `${{Autoscaler.RUNNER_LABELS}}` | Reference — the labels must match or the autoscaler serves jobs no runner picks up. |
+| `ACCESS_TOKEN` | `${{Autoscaler.GITHUB_ACCESS_TOKEN}}` | Reference — the PAT is entered once, on the Autoscaler. |
+| `RUNNER_SCOPE` | `${{Autoscaler.GITHUB_RUNNER_SCOPE}}` | Reference — `repo` or `org`, decided once on the Autoscaler. |
+| `REPO_URL` | `https://github.com/${{Autoscaler.GITHUB_API_REPOSITORY}}` | Reference — read only at `repo` scope; the image ignores it at `org` scope. |
+| `ORG_NAME` | `${{Autoscaler.GITHUB_API_REPOSITORY}}` | Reference — read only at `org` scope, where that variable holds a bare org name; ignored at `repo` scope. |
+| `LABELS` | `${{Autoscaler.GITHUB_RUNNER_LABELS}}` | Reference — the labels must match or the autoscaler serves jobs no runner picks up. |
 | `EPHEMERAL` | `true` | One job per container, so no state leaks between jobs. |
-| `RUNNER_SCOPE` | `repo` | Register against a single repository. |
 | `RUNNER_NAME_PREFIX` | `railway` | Each replica appends a random suffix, so replicas never collide. |
 | `DISABLE_AUTO_UPDATE` | `true` | The image is the update mechanism; in-place updates fight it. |
 
@@ -104,14 +106,14 @@ re-registering, which is the opposite of what an ephemeral runner wants.
 
 ## Switching to org-scoped runners
 
-The template deploys repo-scoped, which is the common case and the one whose
-variables can be wired by reference. A deployed project is converted to serve a
-whole organization by changing variables only:
+The template deploys repo-scoped, which is the common case. Because both
+services read the scope and the target from the Autoscaler, converting a
+deployed project to serve a whole organization touches one service:
 
 | Service | Change |
 | --- | --- |
-| Autoscaler | Remove `GITHUB_API_REPOSITORY`; set `GITHUB_API_ORGANIZATION` to the org name. |
-| Runner | Remove `REPO_URL`; set `RUNNER_SCOPE` to `org` and `ORG_NAME` to the org name. |
+| Autoscaler | Set `GITHUB_RUNNER_SCOPE` to `org`, and replace `GITHUB_API_REPOSITORY`'s `owner/repo` with the bare org name. |
+| Runner | Nothing — `RUNNER_SCOPE`, `ORG_NAME`, and `REPO_URL` all follow by reference, and the image reads only the pair its scope calls for. |
 
 The PAT then needs org-runner permissions instead: classic `admin:org`, or
 fine-grained organization **Self-hosted runners: read and write** (write is the
@@ -124,11 +126,6 @@ runner liveness (dead pools are still detected and recycled) while job counts
 stay webhook-driven. The [README](README.md#org-scoped-runners) covers the
 consequences.
 
-## Marketplace overview
-
-Paste [template-overview.md](template-overview.md) as the template overview. It
-follows Railway's [required structure](https://docs.railway.com/templates/best-practices#overview).
-
 ## Before publishing
 
 - Set a 1:1 transparent icon on the template and on both services.
@@ -137,3 +134,71 @@ follows Railway's [required structure](https://docs.railway.com/templates/best-p
   template.
 - Deploy the template once into a clean project and run a real workflow through
   it before publishing.
+
+## Marketplace overview
+
+Everything below the rule is the template's overview copy, following Railway's
+[required structure](https://docs.railway.com/templates/best-practices#overview).
+Paste it verbatim into the composer's overview field, promoting each heading by
+one level (`##` becomes `#`).
+
+---
+
+## Deploy and Host autoscaled-github-actions-runner on Railway
+
+autoscaled-github-actions-runner is a self-hosted GitHub Actions runner pool that scales itself. An autoscaler service reads `workflow_job` webhooks, tracks how many jobs are queued or running, and drives the runner pool's replica count to match — growing the moment work arrives, shrinking only once it is safe. Each runner takes exactly one job, then exits.
+
+### About Hosting autoscaled-github-actions-runner
+
+Self-hosted runners are usually left always-on, which you pay for around the clock, or scaled by hand, which means someone has to notice the queue. Automating it is harder than it looks. The platform picks which replica to terminate and cannot know which one is mid-job. GitHub never retries a failed webhook, so one missed delivery can strand a job indefinitely. And a runner that exits without its container being rebuilt leaves behind a replica that serves nothing. This template handles all three: scale-down is gated on in-progress work, an idle cooldown, and a startup grace, and the autoscaler reconciles against the GitHub API every cycle, so a lost webhook or a dead pool recovers on its own.
+
+### Common Use Cases
+
+- Cutting CI spend by scaling runners to zero between jobs instead of paying for idle capacity
+- Running jobs that need reach into a private network, internal registry, or database
+- Escaping GitHub-hosted concurrency limits during release crunches
+- Builds that want more CPU or memory than a standard GitHub-hosted runner offers
+- Keeping build caches and toolchains on infrastructure you control
+
+### Dependencies for autoscaled-github-actions-runner Hosting
+
+- A GitHub repository with Actions enabled
+- A GitHub personal access token, used to register runners and to reconcile job state
+- A Railway workspace token, so the autoscaler can change the runner pool's replica count
+- [`myoung34/github-runner`](https://github.com/myoung34/docker-github-actions-runner), which provides the runner container
+- [Autoscaler source and configuration reference](https://github.com/ggoggam/railway-github-runner-autoscaler)
+
+#### Implementation Details
+
+After deploying, three steps finish the setup. Two are tokens the template cannot mint for you; the third is a webhook only you can add.
+
+Paste a **Railway workspace token** ([railway.com/account/tokens](https://railway.com/account/tokens)) and a **GitHub PAT** into the Autoscaler service. The PAT needs `repo` scope, or fine-grained **Administration: read and write** plus **Actions: read** — write is required because the runner uses the same token to register itself.
+
+Then add a webhook to the repository under **Settings → Webhooks → Add webhook**:
+
+- **Payload URL**: `https://<your-autoscaler-domain>/webhook`
+- **Content type**: `application/json`
+- **Secret**: the `GITHUB_WEBHOOK_SECRET` value generated on the Autoscaler service
+- **Events**: *Let me select individual events* → **Workflow jobs** only
+
+Finally, point a job at the pool:
+
+```yaml
+jobs:
+  build:
+    runs-on: [self-hosted, railway]
+```
+
+The labels must match `GITHUB_RUNNER_LABELS`. `GET /status` on the autoscaler reports current queued and in-progress counts alongside the live runner count.
+
+Two things worth knowing. Run exactly one replica of the Autoscaler — job state is held in memory, so a second replica would scale against its own partial view. And `MIN_REPLICAS` defaults to `0`, which costs nothing while idle at the price of a cold start on the first job; raise it to keep a runner warm.
+
+The template deploys repo-scoped runners. To serve a whole organization instead, set `GITHUB_RUNNER_SCOPE=org` on the Autoscaler and put the organization name in `GITHUB_API_REPOSITORY` (the Runner follows by reference), then add the webhook at the organization level. The [configuration reference](https://github.com/ggoggam/railway-github-runner-autoscaler#org-scoped-runners) covers the details.
+
+### Why Deploy autoscaled-github-actions-runner on Railway?
+
+Railway is a singular platform to deploy your infrastructure stack. Railway will host your infrastructure so you don't have to deal with configuration, while allowing you to vertically and horizontally scale it.
+
+By deploying autoscaled-github-actions-runner on Railway, you are one step closer to supporting a complete full-stack application with minimal burden. Host your servers, databases, AI agents, and more on Railway.
+
+---

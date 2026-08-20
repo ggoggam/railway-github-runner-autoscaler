@@ -19,11 +19,15 @@ type Config struct {
 	// GitHub
 	WebhookSecret string
 	RunnerLabels  []string
-	// GitHubToken plus exactly one of Repository (owner/repo) or Organization
-	// enable reconciliation against GitHub. Leaving them all empty runs the
-	// autoscaler webhook-only. Organization selects org-scoped runners; note
-	// that GitHub has no org-level jobs API, so at org scope only runner
-	// liveness is reconciled and job state stays webhook-driven.
+	// RunnerScope mirrors RUNNER_SCOPE on myoung34/github-runner: ScopeRepo or
+	// ScopeOrg. It decides how Repository is read, so one variable can feed both
+	// the runner's REPO_URL and its ORG_NAME.
+	RunnerScope string
+	// Repository is owner/repo at repo scope and a bare organization name at org
+	// scope. Together with GitHubToken it enables reconciliation against GitHub;
+	// leaving both empty runs the autoscaler webhook-only. Note that GitHub has
+	// no org-level jobs API, so at org scope only runner liveness is reconciled
+	// and job state stays webhook-driven.
 	//
 	// These deliberately avoid the GITHUB_TOKEN / GITHUB_REPOSITORY /
 	// GITHUB_API_URL names: GitHub Actions injects those into every workflow
@@ -31,7 +35,6 @@ type Config struct {
 	// configuration.
 	GitHubToken  string
 	Repository   string
-	Organization string
 	GitHubAPIURL string
 	RunnerGrace  time.Duration
 
@@ -59,15 +62,25 @@ type Config struct {
 	Port string
 }
 
+// Runner scopes, matching the RUNNER_SCOPE values the runner image accepts.
+const (
+	ScopeRepo = "repo"
+	ScopeOrg  = "org"
+)
+
 // Defaults applied when the corresponding variable is unset.
 const (
-	DefaultMaxRunners   = 3
-	DefaultMinReplicas  = 1
-	DefaultPort         = "8080"
+	DefaultMaxRunners = 3
+	// DefaultMinReplicas is 0: idle costs nothing, at the price of a cold start
+	// on the first job. Raise it to keep a runner warm.
+	DefaultMinReplicas = 0
+	DefaultPort        = "8080"
+	// DefaultRunnerScope matches the runner image's own default.
+	DefaultRunnerScope  = ScopeRepo
 	DefaultRunnerLabels = "self-hosted,railway"
 	// DefaultServiceName matches the service name the Railway template gives the
 	// runner pool.
-	DefaultServiceName  = "Runner"
+	DefaultServiceName  = "github-runner"
 	DefaultIdleCooldown = 60 * time.Second
 	DefaultJobTTL       = 6 * time.Hour
 	DefaultResyncPeriod = 30 * time.Second
@@ -90,6 +103,10 @@ func Load() (Config, error) {
 		ResyncPeriod: DefaultResyncPeriod,
 		StartupGrace: DefaultStartupGrace,
 		RunnerGrace:  DefaultRunnerGrace,
+	}
+
+	if err := rejectRemovedVars(); err != nil {
+		return Config{}, err
 	}
 
 	// Required.
@@ -129,29 +146,41 @@ func Load() (Config, error) {
 	// Optional. Empty means "discover from the service's current deployment".
 	cfg.Region = strings.TrimSpace(os.Getenv("RAILWAY_RUNNER_REGION"))
 
+	// The scope decides how GITHUB_API_REPOSITORY is read, which is what lets a
+	// single variable feed both REPO_URL and ORG_NAME on the runner service.
+	cfg.RunnerScope = strings.ToLower(strings.TrimSpace(os.Getenv("GITHUB_RUNNER_SCOPE")))
+	if cfg.RunnerScope == "" {
+		cfg.RunnerScope = DefaultRunnerScope
+	}
+	switch cfg.RunnerScope {
+	case ScopeRepo, ScopeOrg:
+	case "ent", "enterprise":
+		return Config{}, fmt.Errorf("GITHUB_RUNNER_SCOPE=%q is not supported: "+
+			"the enterprise runner APIs are not implemented", cfg.RunnerScope)
+	default:
+		return Config{}, fmt.Errorf("GITHUB_RUNNER_SCOPE must be %q or %q, got %q",
+			ScopeRepo, ScopeOrg, cfg.RunnerScope)
+	}
+
 	// Optional, but paired: reconciling against GitHub needs a credential and
-	// exactly one scope to ask about — a repository or an organization.
-	// Accepting a partial configuration would silently leave the autoscaler
-	// webhook-only.
-	cfg.GitHubToken = strings.TrimSpace(os.Getenv("GITHUB_API_TOKEN"))
+	// something to ask about. Accepting a partial configuration would silently
+	// leave the autoscaler webhook-only.
+	cfg.GitHubToken = strings.TrimSpace(os.Getenv("GITHUB_ACCESS_TOKEN"))
 	cfg.Repository = strings.TrimSpace(os.Getenv("GITHUB_API_REPOSITORY"))
-	cfg.Organization = strings.TrimSpace(os.Getenv("GITHUB_API_ORGANIZATION"))
 	switch {
-	case cfg.Repository != "" && cfg.Organization != "":
-		return Config{}, fmt.Errorf("set GITHUB_API_REPOSITORY or GITHUB_API_ORGANIZATION, not both; " +
-			"runners register at exactly one scope")
-	case cfg.GitHubToken != "" && cfg.Repository == "" && cfg.Organization == "":
-		return Config{}, fmt.Errorf("GITHUB_API_REPOSITORY (owner/repo) or GITHUB_API_ORGANIZATION is required when GITHUB_API_TOKEN is set")
-	case (cfg.Repository != "" || cfg.Organization != "") && cfg.GitHubToken == "":
-		return Config{}, fmt.Errorf("GITHUB_API_TOKEN is required when GITHUB_API_REPOSITORY or GITHUB_API_ORGANIZATION is set")
-	case cfg.Repository != "":
+	case cfg.GitHubToken != "" && cfg.Repository == "":
+		return Config{}, fmt.Errorf("GITHUB_API_REPOSITORY (%s) is required when GITHUB_ACCESS_TOKEN is set",
+			repositoryShape(cfg.RunnerScope))
+	case cfg.Repository != "" && cfg.GitHubToken == "":
+		return Config{}, fmt.Errorf("GITHUB_ACCESS_TOKEN is required when GITHUB_API_REPOSITORY is set")
+	case cfg.Repository != "" && cfg.RunnerScope == ScopeRepo:
 		if _, _, err := github.SplitRepository(cfg.Repository); err != nil {
-			return Config{}, fmt.Errorf("GITHUB_API_REPOSITORY: %w", err)
+			return Config{}, fmt.Errorf("GITHUB_API_REPOSITORY: %w at GITHUB_RUNNER_SCOPE=%s", err, ScopeRepo)
 		}
-	case cfg.Organization != "":
-		if strings.Contains(cfg.Organization, "/") {
-			return Config{}, fmt.Errorf("GITHUB_API_ORGANIZATION must be a bare org name, got %q; "+
-				"owner/repo belongs in GITHUB_API_REPOSITORY", cfg.Organization)
+	case cfg.Repository != "" && cfg.RunnerScope == ScopeOrg:
+		if strings.Contains(cfg.Repository, "/") {
+			return Config{}, fmt.Errorf("GITHUB_API_REPOSITORY must be a bare organization name at "+
+				"GITHUB_RUNNER_SCOPE=%s, got %q", ScopeOrg, cfg.Repository)
 		}
 	}
 
@@ -200,13 +229,13 @@ func Load() (Config, error) {
 		cfg.Port = v
 	}
 
-	labels := os.Getenv("RUNNER_LABELS")
+	labels := os.Getenv("GITHUB_RUNNER_LABELS")
 	if strings.TrimSpace(labels) == "" {
 		labels = DefaultRunnerLabels
 	}
 	cfg.RunnerLabels = NormalizeLabels(labels)
 	if len(cfg.RunnerLabels) == 0 {
-		return Config{}, fmt.Errorf("RUNNER_LABELS must contain at least one non-empty label")
+		return Config{}, fmt.Errorf("GITHUB_RUNNER_LABELS must contain at least one non-empty label")
 	}
 
 	return cfg, nil
@@ -243,6 +272,32 @@ func NormalizeLabels(s string) []string {
 		}
 	}
 	return out
+}
+
+// removedVars are names an earlier release read. Ignoring one silently would
+// leave a live deployment reconciling nothing, so Load refuses to start and
+// names the replacement instead.
+var removedVars = []struct{ old, replacement string }{
+	{"GITHUB_API_TOKEN", "GITHUB_ACCESS_TOKEN"},
+	{"GITHUB_API_ORGANIZATION", "GITHUB_RUNNER_SCOPE=org with the organization name in GITHUB_API_REPOSITORY"},
+	{"RUNNER_LABELS", "GITHUB_RUNNER_LABELS"},
+}
+
+func rejectRemovedVars() error {
+	for _, v := range removedVars {
+		if strings.TrimSpace(os.Getenv(v.old)) != "" {
+			return fmt.Errorf("%s is no longer read; use %s", v.old, v.replacement)
+		}
+	}
+	return nil
+}
+
+// repositoryShape describes what GITHUB_API_REPOSITORY must hold at a scope.
+func repositoryShape(scope string) string {
+	if scope == ScopeOrg {
+		return "the organization name"
+	}
+	return "owner/repo"
 }
 
 func envInt(key string, minimum int, dst *int) error {

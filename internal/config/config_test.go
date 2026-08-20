@@ -40,6 +40,9 @@ func TestLoadDefaults(t *testing.T) {
 	if !reflect.DeepEqual(cfg.RunnerLabels, []string{"self-hosted", "railway"}) {
 		t.Errorf("RunnerLabels = %v", cfg.RunnerLabels)
 	}
+	if cfg.RunnerScope != ScopeRepo {
+		t.Errorf("RunnerScope = %q, want %q", cfg.RunnerScope, ScopeRepo)
+	}
 }
 
 func TestLoadRequiresEachSecret(t *testing.T) {
@@ -63,7 +66,7 @@ func TestLoadOverrides(t *testing.T) {
 	t.Setenv("MAX_RUNNERS", "12")
 	t.Setenv("MIN_REPLICAS", "0")
 	t.Setenv("PORT", "9090")
-	t.Setenv("RUNNER_LABELS", " Railway , Self-Hosted ")
+	t.Setenv("GITHUB_RUNNER_LABELS", " Railway , Self-Hosted ")
 	t.Setenv("IDLE_COOLDOWN", "90s")
 	t.Setenv("STARTUP_GRACE", "10m")
 	t.Setenv("JOB_TTL", "2h")
@@ -100,7 +103,9 @@ func TestLoadRejectsBadValues(t *testing.T) {
 		"min negative":         {"MIN_REPLICAS": "-1"},
 		"bad duration":         {"IDLE_COOLDOWN": "soon"},
 		"zero resync":          {"RESYNC_PERIOD": "0s"},
-		"blank labels":         {"RUNNER_LABELS": " , , "},
+		"blank labels":         {"GITHUB_RUNNER_LABELS": " , , "},
+		"unknown scope":        {"GITHUB_RUNNER_SCOPE": "team"},
+		"enterprise scope":     {"GITHUB_RUNNER_SCOPE": "ent"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			setRequiredEnv(t)
@@ -152,21 +157,23 @@ func TestNormalizeLabels(t *testing.T) {
 	}
 }
 
-// Reconciling against GitHub needs a credential plus exactly one scope —
-// repository or organization. A partial configuration would quietly leave the
-// autoscaler webhook-only, which is the failure mode this feature exists to
-// remove; both scopes at once would leave which pool to watch ambiguous.
-func TestGitHubReconcileRequiresTokenAndExactlyOneScope(t *testing.T) {
+// Reconciling against GitHub needs a credential plus something to ask about. A
+// partial configuration would quietly leave the autoscaler webhook-only, which
+// is the failure mode this feature exists to remove. The shape of the target
+// depends on the scope, and a mismatch means the autoscaler would watch a pool
+// the runners never register with.
+func TestGitHubReconcileRequiresTokenAndAWellFormedTarget(t *testing.T) {
 	for name, env := range map[string]map[string]string{
-		"token without repository or org": {"GITHUB_API_TOKEN": "ghp_x"},
-		"repository without token":        {"GITHUB_API_REPOSITORY": "acme/widgets"},
-		"organization without token":      {"GITHUB_API_ORGANIZATION": "acme"},
-		"malformed repository":            {"GITHUB_API_TOKEN": "ghp_x", "GITHUB_REPOSITORY": "acme"},
-		"org with a slash":                {"GITHUB_API_TOKEN": "ghp_x", "GITHUB_API_ORGANIZATION": "acme/widgets"},
-		"both repository and org": {
-			"GITHUB_API_TOKEN":        "ghp_x",
-			"GITHUB_API_REPOSITORY":   "acme/widgets",
-			"GITHUB_API_ORGANIZATION": "acme",
+		"token without a target": {"GITHUB_ACCESS_TOKEN": "ghp_x"},
+		"target without token":   {"GITHUB_API_REPOSITORY": "acme/widgets"},
+		"bare owner at repo scope": {
+			"GITHUB_ACCESS_TOKEN":   "ghp_x",
+			"GITHUB_API_REPOSITORY": "acme",
+		},
+		"owner/repo at org scope": {
+			"GITHUB_RUNNER_SCOPE":   "org",
+			"GITHUB_ACCESS_TOKEN":   "ghp_x",
+			"GITHUB_API_REPOSITORY": "acme/widgets",
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -176,6 +183,20 @@ func TestGitHubReconcileRequiresTokenAndExactlyOneScope(t *testing.T) {
 			}
 			if _, err := Load(); err == nil {
 				t.Fatal("want an error, got none")
+			}
+		})
+	}
+}
+
+// Names an earlier release read must fail loudly rather than be ignored: a
+// deployment still setting them would otherwise reconcile nothing.
+func TestLoadRejectsRemovedVariableNames(t *testing.T) {
+	for _, removed := range removedVars {
+		t.Run(removed.old, func(t *testing.T) {
+			setRequiredEnv(t)
+			t.Setenv(removed.old, "value")
+			if _, err := Load(); err == nil {
+				t.Fatalf("want an error naming %s", removed.old)
 			}
 		})
 	}
@@ -201,7 +222,7 @@ func TestGitHubReconcileOptional(t *testing.T) {
 
 func TestGitHubReconcileEnabled(t *testing.T) {
 	setRequiredEnv(t)
-	t.Setenv("GITHUB_API_TOKEN", "ghp_x")
+	t.Setenv("GITHUB_ACCESS_TOKEN", "ghp_x")
 	t.Setenv("GITHUB_API_REPOSITORY", "acme/widgets")
 	t.Setenv("RUNNER_GRACE", "90s")
 
@@ -218,21 +239,23 @@ func TestGitHubReconcileEnabled(t *testing.T) {
 }
 
 // Runners can be registered against an organization instead of a single
-// repository; the autoscaler must accept that scope too.
+// repository. At org scope the same variable carries a bare org name, so the
+// runner service can wire REPO_URL and ORG_NAME from one value.
 func TestGitHubReconcileEnabledAtOrgScope(t *testing.T) {
 	setRequiredEnv(t)
-	t.Setenv("GITHUB_API_TOKEN", "ghp_x")
-	t.Setenv("GITHUB_API_ORGANIZATION", " acme ")
+	t.Setenv("GITHUB_RUNNER_SCOPE", " Org ")
+	t.Setenv("GITHUB_ACCESS_TOKEN", "ghp_x")
+	t.Setenv("GITHUB_API_REPOSITORY", " acme ")
 
 	cfg, err := Load()
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if cfg.Organization != "acme" {
-		t.Fatalf("got organization %q", cfg.Organization)
+	if cfg.RunnerScope != ScopeOrg {
+		t.Fatalf("got scope %q, want %q", cfg.RunnerScope, ScopeOrg)
 	}
-	if cfg.Repository != "" {
-		t.Fatalf("want no repository at org scope, got %q", cfg.Repository)
+	if cfg.Repository != "acme" {
+		t.Fatalf("got organization %q", cfg.Repository)
 	}
 }
 
