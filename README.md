@@ -1,6 +1,6 @@
 # railway-github-runner-autoscaler
 
-Scales a pool of self-hosted GitHub Actions runners on [Railway](https://railway.com) in response to `workflow_job` webhooks.
+Scales a pool of self-hosted GitHub Actions runners on [Railway](https://railway.com) or [Fly.io](https://fly.io) in response to `workflow_job` webhooks.
 
 A small Go service that listens for GitHub webhooks, tracks how many jobs are waiting or running, and drives the runner service's replica count to match — scaling up the moment work arrives and back down once it is safe.
 
@@ -26,6 +26,9 @@ GitHub ──workflow_job webhook──▶ autoscaler ──GraphQL──▶ Rai
 
 Each runner replica is an **ephemeral** runner: it registers, takes exactly one job, then exits. Railway restarts it, and it registers again. The autoscaler only decides *how many* of those replicas should exist.
 
+Railway is the default backend. Setting `RUNNER_BACKEND=fly` scales a pool of Fly
+Machines instead; see [Fly backend](#fly-backend).
+
 ## Layout
 
 ```
@@ -33,6 +36,7 @@ cmd/autoscaler/      entrypoint: config loading, wiring, graceful shutdown
 internal/config/     environment parsing and validation
 internal/scaler/     job tracking and the reconcile loop (the scaling logic)
 internal/railway/    Railway GraphQL client: replica reads/writes, retries
+internal/fly/        Fly Machines client and the pool that starts/stops runners
 internal/webhook/    GitHub webhook auth, parsing, and HTTP routes
 internal/bounded/    fixed-capacity set used for de-duplication
 ```
@@ -128,6 +132,69 @@ jobs:
 ```
 
 The labels must match `GITHUB_RUNNER_LABELS`.
+
+## Fly backend
+
+With `RUNNER_BACKEND=fly` the runner pool is a separate Fly app whose Machines are
+each one ephemeral runner. The autoscaler never creates or destroys Machines; it
+only starts and stops the ones that exist, so the pool size is the app's Machine
+count.
+
+```
+GitHub ──workflow_job webhook──▶ autoscaler ──Machines API──▶ runner app
+                                                               (N stopped Machines;
+                                                                started on demand)
+```
+
+- **Scaling up** starts stopped Machines.
+- **A finished job scales itself down.** The runner exits after its one job, and
+  with restart policy `never` the Machine stays stopped. Fly rebuilds the root
+  filesystem from the image on every start, so each job gets a clean runner.
+  Because the pool shrinks on its own, the autoscaler re-reads the live Machine
+  count every reconcile rather than trusting the count it last applied.
+- **Scaling down stops only idle runners.** Runners register as
+  `<RUNNER_NAME_PREFIX>-<hostname>`, and a Machine's hostname is its ID, so with
+  `GITHUB_ACCESS_TOKEN` set the autoscaler matches runners to Machines and never
+  stops one GitHub reports as busy. If GitHub cannot be read, the scale-down waits.
+- **Idle cost** is the autoscaler Machine plus root-filesystem storage for the
+  stopped runners. Nothing else runs while no jobs are queued.
+
+### Setup
+
+1. Create two apps, then deploy the runner pool from [`fly.runner.toml`](fly.runner.toml)
+   and size it to `MAX_RUNNERS`:
+   ```bash
+   fly apps create <runner-app>
+   fly apps create <autoscaler-app>
+   fly secrets set -a <runner-app> --stage ACCESS_TOKEN=<pat> REPO_URL=https://github.com/<owner>/<repo>
+   fly deploy -c fly.runner.toml -a <runner-app> --ha=false
+   fly scale count <MAX_RUNNERS> -c fly.runner.toml -a <runner-app>
+   ```
+   Machines that start during the deploy register as idle runners; once the
+   autoscaler is up it stops them after `STARTUP_GRACE`.
+2. Configure and deploy the autoscaler from [`fly.toml`](fly.toml). It must run on
+   exactly one Machine:
+   ```bash
+   fly secrets set -a <autoscaler-app> --stage \
+     GITHUB_WEBHOOK_SECRET=<secret> GITHUB_ACCESS_TOKEN=<pat> GITHUB_API_REPOSITORY=<owner>/<repo> \
+     FLY_RUNNER_APP=<runner-app> FLY_API_TOKEN="$(fly tokens create deploy -a <runner-app>)"
+   fly deploy -a <autoscaler-app> --ha=false
+   ```
+3. Point the GitHub webhook at `https://<autoscaler-app>.fly.dev/webhook`
+   ([step 3](#3-add-the-github-webhook)) and target jobs with the `fly` label (or
+   whatever `LABELS` / `GITHUB_RUNNER_LABELS` you set).
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `RUNNER_BACKEND` | `railway` | `fly` selects this backend. The Railway variables are then not read. |
+| `FLY_API_TOKEN` | required | A token that can start and stop the runner app's Machines. A deploy token scoped to that app (`fly tokens create deploy -a <runner-app>`) is enough. |
+| `FLY_RUNNER_APP` | required | The runner app. Must not be the autoscaler's own app. |
+| `FLY_API_URL` | `https://api.machines.dev` | Override the Machines API endpoint. |
+
+Every other variable (`GITHUB_*`, `MAX_RUNNERS`, `MIN_REPLICAS`, the timings)
+works as described above. The default runner Machine has a root filesystem of
+about 8 GB; jobs that need more disk need a larger `--rootfs-size` or a
+GitHub-hosted runner.
 
 ## Railway template
 

@@ -16,6 +16,17 @@ type Backend interface {
 	SetReplicas(ctx context.Context, n int) error
 }
 
+// Counter is implemented by backends whose replica count also changes on its
+// own. Fly Machines stop themselves when their ephemeral runner exits, so the
+// count last applied goes stale after every job; the autoscaler re-reads it
+// before each decision instead of trusting what it last wrote.
+type Counter interface {
+	Replicas(ctx context.Context) (int, error)
+}
+
+// countTimeout caps a single Replicas call, like observeTimeout.
+const countTimeout = 20 * time.Second
+
 // Observation is ground truth read back from GitHub.
 type Observation struct {
 	// JobsObserved reports whether Queued and InProgress carry ground truth.
@@ -236,7 +247,8 @@ func (a *Autoscaler) decide() decision {
 	d := decision{desired: want, queued: q, inProgress: ip}
 
 	// Scaling down is the dangerous direction: Railway picks which replica to
-	// terminate, so shrinking while a runner is mid-job kills that job.
+	// terminate, so shrinking while a runner is mid-job kills that job. The Fly
+	// pool stops only idle Machines, but the gates still absorb webhook lag.
 	if a.applied >= 0 && want < a.applied {
 		now := a.now()
 		switch {
@@ -414,7 +426,28 @@ func (a *Autoscaler) recycle(ctx context.Context, n int) error {
 	return nil
 }
 
+// recount refreshes applied from a backend that can report its live count.
+func (a *Autoscaler) recount(ctx context.Context) {
+	c, ok := a.backend.(Counter)
+	if !ok {
+		return
+	}
+	countCtx, cancel := context.WithTimeout(ctx, countTimeout)
+	defer cancel()
+
+	n, err := c.Replicas(countCtx)
+	if err != nil {
+		// Keep the last known count; the next tick retries.
+		a.logger.Warn("reading replica count failed", "err", err)
+		return
+	}
+	a.mu.Lock()
+	a.applied = n
+	a.mu.Unlock()
+}
+
 func (a *Autoscaler) reconcile(ctx context.Context) {
+	a.recount(ctx)
 	a.observe(ctx)
 	a.gc()
 

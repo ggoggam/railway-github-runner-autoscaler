@@ -1,0 +1,39 @@
+# Fly.io config for the autoscaler. The runner pool it scales is fly.runner.toml.
+# https://fly.io/docs/reference/configuration/
+#
+# No `app` here, so one file serves any deployment; name yours on the command line.
+# Job state is in memory, so run exactly one Machine (--ha=false):
+#   fly deploy -a <autoscaler-app> --ha=false
+#
+# Settings are Fly secrets (`fly secrets set -a <autoscaler-app> ...`):
+#   GITHUB_WEBHOOK_SECRET, GITHUB_ACCESS_TOKEN, GITHUB_API_REPOSITORY,
+#   FLY_API_TOKEN (`fly tokens create deploy -a <runner-app>`), FLY_RUNNER_APP.
+# See the README for the rest.
+
+primary_region = "nrt"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  RUNNER_BACKEND = "fly"
+  GITHUB_RUNNER_LABELS = "fly"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  # Job state lives in memory and webhooks must always land, so never stop it.
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [[http_service.checks]]
+    method = "GET"
+    path = "/health"
+    interval = "30s"
+    timeout = "5s"
+    grace_period = "10s"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"

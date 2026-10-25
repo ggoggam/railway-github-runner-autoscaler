@@ -1,0 +1,46 @@
+# Fly.io config for the runner pool the autoscaler (fly.toml) scales.
+# https://fly.io/docs/reference/configuration/
+#
+# Every Machine in this app is one ephemeral runner. It registers, takes one job,
+# exits, and the Machine stops; Fly rebuilds the root filesystem from the image on
+# the next start, so every job gets a clean runner. The autoscaler only starts and
+# stops these Machines; it never creates them. Size the pool to MAX_RUNNERS:
+#   fly deploy -c fly.runner.toml -a <runner-app> --ha=false
+#   fly scale count <MAX_RUNNERS> -c fly.runner.toml -a <runner-app>
+#
+# Secrets (`fly secrets set -a <runner-app> ...`):
+#   ACCESS_TOKEN  GitHub PAT that can register runners (same one as the autoscaler's
+#                 GITHUB_ACCESS_TOKEN, with the write permission)
+#   REPO_URL      https://github.com/<owner>/<repo>  (or ORG_NAME with RUNNER_SCOPE=org)
+
+primary_region = "nrt"
+
+# The runner traps SIGTERM and deregisters itself before exiting.
+kill_signal = "SIGTERM"
+kill_timeout = "30s"
+
+[build]
+  # Match GitHub's ubuntu-latest (24.04). The image's `latest` tag is Ubuntu 20.04,
+  # whose Python 3.8 is too old for current pre-commit hooks.
+  image = "myoung34/github-runner:ubuntu-noble"
+
+[env]
+  # Must match GITHUB_RUNNER_LABELS on the autoscaler.
+  LABELS = "fly"
+  RUNNER_SCOPE = "repo"
+  EPHEMERAL = "true"
+  DISABLE_AUTO_UPDATE = "true"
+  # Name runners fly-<hostname>. A Machine's hostname is its ID, which is how
+  # the autoscaler tells which Machines are mid-job and must not be stopped.
+  RANDOM_RUNNER_SUFFIX = "false"
+  RUNNER_NAME_PREFIX = "fly"
+
+# An ephemeral runner exits 0 after every job. The Machine must then stay
+# stopped until the autoscaler starts it again; any restart policy would bring it
+# straight back as an idle runner nobody asked for.
+[[restart]]
+  policy = "never"
+
+[[vm]]
+  size = "shared-cpu-8x"
+  memory = "8gb"
