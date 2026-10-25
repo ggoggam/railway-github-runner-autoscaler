@@ -41,6 +41,10 @@ kill_timeout = "30s"
 [[restart]]
   policy = "never"
 
+# Dedicated CPUs. Shared vCPUs are throttled to a small baseline under sustained
+# load, and a cold Go or Kotlin build is exactly that: on shared-cpu-8x a lint that
+# takes ~6 minutes on a hosted runner timed out. Billing is per second while
+# running, so the rate matters far less than for an always-on app.
 [[vm]]
-  size = "shared-cpu-8x"
+  size = "performance-4x"
   memory = "8gb"
