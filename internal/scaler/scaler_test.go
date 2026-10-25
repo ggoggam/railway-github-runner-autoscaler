@@ -504,3 +504,73 @@ func TestNoObserverLeavesBehaviourUnchanged(t *testing.T) {
 		t.Fatalf("want liveRunners unknown without an observer, got %d", s.LiveRunners)
 	}
 }
+
+// countingBackend is a backend whose replica count drifts on its own, like a Fly
+// pool whose Machines stop when their ephemeral runner exits.
+type countingBackend struct {
+	fakeBackend
+	live int
+	err  error
+}
+
+func (c *countingBackend) Replicas(context.Context) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.live, c.err
+}
+
+func (c *countingBackend) SetReplicas(ctx context.Context, n int) error {
+	if err := c.fakeBackend.SetReplicas(ctx, n); err != nil {
+		return err
+	}
+	c.mu.Lock()
+	c.live = n
+	c.mu.Unlock()
+	return nil
+}
+
+func TestCounterRefreshesAppliedBeforeDeciding(t *testing.T) {
+	opts := testOptions()
+	opts.MinReplicas = 0
+	cb := &countingBackend{}
+	a := New(opts, cb, discardLogger())
+	clock := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	a.now = func() time.Time { return clock }
+	a.startedAt = clock.Add(-opts.StartupGrace - time.Second)
+
+	a.OnQueued(1)
+	a.OnQueued(2)
+	a.reconcile(t.Context())
+	if got, _ := cb.last(); got != 2 {
+		t.Fatalf("want 2 replicas, got %d", got)
+	}
+
+	// Job 1 finishes and its Machine stops itself; job 3 arrives. On paper the
+	// pool is already at 2, so without a recount nothing would start for job 3.
+	a.OnInProgress(2)
+	a.OnCompleted(1)
+	a.OnQueued(3)
+	cb.mu.Lock()
+	cb.live = 1
+	cb.mu.Unlock()
+	a.reconcile(t.Context())
+
+	if n := cb.count(); n != 2 {
+		t.Fatalf("want a second SetReplicas call after the recount, got calls %v", cb.calls)
+	}
+	if got, _ := cb.last(); got != 2 {
+		t.Fatalf("want the pool brought back to 2, got %d", got)
+	}
+}
+
+func TestCounterFailureKeepsLastApplied(t *testing.T) {
+	cb := &countingBackend{live: 3, err: errors.New("fly down")}
+	a := New(testOptions(), cb, discardLogger())
+	a.SetBaseline(2)
+
+	a.recount(t.Context())
+
+	if got := a.Stats().Replicas; got != 2 {
+		t.Fatalf("want applied kept at 2 on a failed recount, got %d", got)
+	}
+}

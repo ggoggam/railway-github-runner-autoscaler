@@ -1,5 +1,5 @@
 // Command autoscaler scales a pool of ephemeral self-hosted GitHub Actions
-// runners on Railway in response to workflow_job webhooks.
+// runners on Railway or Fly in response to workflow_job webhooks.
 package main
 
 import (
@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/ggoggam/railway-github-runner-autoscaler/internal/config"
+	"github.com/ggoggam/railway-github-runner-autoscaler/internal/fly"
 	"github.com/ggoggam/railway-github-runner-autoscaler/internal/github"
 	"github.com/ggoggam/railway-github-runner-autoscaler/internal/railway"
 	"github.com/ggoggam/railway-github-runner-autoscaler/internal/scaler"
@@ -158,21 +159,10 @@ func run(logger *slog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	client := railway.NewClient(cfg.RailwayToken, logger)
-	client.Endpoint = cfg.APIEndpoint
-
-	serviceID, err := resolveServiceID(ctx, client, cfg, logger)
-	if err != nil {
-		return err
-	}
-
-	backend := &railwayBackend{client: client, serviceID: serviceID, envID: cfg.EnvironmentID}
-	auto := scaler.New(cfg.ScalerOptions(), backend, logger)
-
 	// Optional: without a GitHub credential the autoscaler stays webhook-only,
 	// which is how it behaved before and remains a valid way to run it.
+	var gh *github.Client
 	if cfg.GitHubToken != "" {
-		var gh *github.Client
 		if cfg.RunnerScope == config.ScopeOrg {
 			gh = github.NewOrgClient(cfg.GitHubToken, cfg.Repository, logger)
 			logger.Info("org scope: reconciling runner liveness only; job state stays webhook-driven",
@@ -185,33 +175,27 @@ func run(logger *slog.Logger) error {
 			gh = github.NewClient(cfg.GitHubToken, owner, repo, logger)
 		}
 		gh.Endpoint = cfg.GitHubAPIURL
+	}
+
+	var (
+		auto      *scaler.Autoscaler
+		startArgs []any
+	)
+	switch cfg.Backend {
+	case config.BackendFly:
+		auto, startArgs, err = newFlyAutoscaler(ctx, cfg, gh, logger)
+	default:
+		auto, startArgs, err = newRailwayAutoscaler(ctx, cfg, logger)
+	}
+	if err != nil {
+		return err
+	}
+	if gh != nil {
 		auto.SetObserver(&githubObserver{client: gh, labels: cfg.RunnerLabels})
 	}
 
-	// Learn the service's current regions and replica count. Failure here is not
-	// fatal: SetReplicas falls back to the legacy numReplicas field, and an
-	// unknown baseline just means the first reconcile applies desired state.
-	discoverCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	state, err := client.DiscoverServiceState(discoverCtx, serviceID, cfg.EnvironmentID)
-	cancel()
-	if err != nil {
-		logger.Warn("service discovery failed, falling back to legacy numReplicas", "err", err)
-	} else {
-		backend.regions = state.Regions
-		if state.Replicas >= 0 {
-			auto.SetBaseline(state.Replicas)
-		}
-	}
-
-	// An explicit region always wins over discovery.
-	if cfg.Region != "" {
-		backend.regions = []string{cfg.Region}
-	}
-
-	logger.Info("starting",
-		"service", serviceID,
-		"environment", cfg.EnvironmentID,
-		"regions", backend.regions,
+	logger.Info("starting", append(startArgs,
+		"backend", cfg.Backend,
 		"minReplicas", cfg.MinReplicas,
 		"maxRunners", cfg.MaxRunners,
 		"labels", cfg.RunnerLabels,
@@ -223,8 +207,7 @@ func run(logger *slog.Logger) error {
 		"githubReconcile", cfg.GitHubToken != "",
 		"runnerScope", cfg.RunnerScope,
 		"githubTarget", cfg.Repository,
-		"baselineReplicas", state.Replicas,
-	)
+	)...)
 
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -267,4 +250,102 @@ func run(logger *slog.Logger) error {
 	wg.Wait()
 	logger.Info("stopped")
 	return nil
+}
+
+// newRailwayAutoscaler scales a Railway service's replica count.
+func newRailwayAutoscaler(ctx context.Context, cfg config.Config, logger *slog.Logger) (*scaler.Autoscaler, []any, error) {
+	client := railway.NewClient(cfg.RailwayToken, logger)
+	client.Endpoint = cfg.APIEndpoint
+
+	serviceID, err := resolveServiceID(ctx, client, cfg, logger)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	backend := &railwayBackend{client: client, serviceID: serviceID, envID: cfg.EnvironmentID}
+	auto := scaler.New(cfg.ScalerOptions(), backend, logger)
+
+	// Learn the service's current regions and replica count. Failure here is not
+	// fatal: SetReplicas falls back to the legacy numReplicas field, and an
+	// unknown baseline just means the first reconcile applies desired state.
+	discoverCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	state, err := client.DiscoverServiceState(discoverCtx, serviceID, cfg.EnvironmentID)
+	cancel()
+	if err != nil {
+		logger.Warn("service discovery failed, falling back to legacy numReplicas", "err", err)
+	} else {
+		backend.regions = state.Regions
+		if state.Replicas >= 0 {
+			auto.SetBaseline(state.Replicas)
+		}
+	}
+
+	// An explicit region always wins over discovery.
+	if cfg.Region != "" {
+		backend.regions = []string{cfg.Region}
+	}
+
+	return auto, []any{
+		"service", serviceID,
+		"environment", cfg.EnvironmentID,
+		"regions", backend.regions,
+		"baselineReplicas", state.Replicas,
+	}, nil
+}
+
+// newFlyAutoscaler scales a pool of Fly Machines by starting and stopping them.
+func newFlyAutoscaler(ctx context.Context, cfg config.Config, gh *github.Client, logger *slog.Logger) (*scaler.Autoscaler, []any, error) {
+	client := fly.NewClient(cfg.FlyToken, cfg.FlyRunnerApp, logger)
+	client.Endpoint = cfg.FlyAPIEndpoint
+
+	pool := &fly.Pool{Machines: client, Logger: logger}
+	if gh != nil {
+		pool.Busy = busyRunners(gh, cfg.RunnerLabels)
+	}
+
+	// Reading the pool up front surfaces a bad token or app name at startup
+	// rather than on the first job.
+	listCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	machines, err := client.ListMachines(listCtx)
+	cancel()
+	if err != nil {
+		return nil, nil, fmt.Errorf("list machines in %s: %w", cfg.FlyRunnerApp, err)
+	}
+	active := 0
+	for _, m := range machines {
+		if m.Active() {
+			active++
+		}
+	}
+	if len(machines) < cfg.MaxRunners {
+		logger.Warn("runner app has fewer machines than MAX_RUNNERS; scale it with `fly scale count`",
+			"app", cfg.FlyRunnerApp, "machines", len(machines), "maxRunners", cfg.MaxRunners)
+	}
+
+	auto := scaler.New(cfg.ScalerOptions(), pool, logger)
+	auto.SetBaseline(active)
+
+	return auto, []any{
+		"app", cfg.FlyRunnerApp,
+		"machines", len(machines),
+		"baselineReplicas", active,
+	}, nil
+}
+
+// busyRunners reports the runners in this pool that are mid-job, so the Fly
+// pool never stops a Machine out from under one.
+func busyRunners(gh *github.Client, labels []string) fly.BusyRunners {
+	return func(ctx context.Context) ([]string, error) {
+		runners, err := gh.ListRunners(ctx)
+		if err != nil {
+			return nil, err
+		}
+		var names []string
+		for _, r := range runners {
+			if r.Busy && webhook.MatchesLabels(r.Labels, labels) {
+				names = append(names, r.Name)
+			}
+		}
+		return names, nil
+	}
 }

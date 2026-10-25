@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ggoggam/railway-github-runner-autoscaler/internal/fly"
 	"github.com/ggoggam/railway-github-runner-autoscaler/internal/github"
 	"github.com/ggoggam/railway-github-runner-autoscaler/internal/railway"
 	"github.com/ggoggam/railway-github-runner-autoscaler/internal/scaler"
@@ -38,6 +39,9 @@ type Config struct {
 	GitHubAPIURL string
 	RunnerGrace  time.Duration
 
+	// Backend is where the runner pool lives: BackendRailway or BackendFly.
+	Backend string
+
 	// Railway
 	RailwayToken string
 	// ServiceID is the runner service to scale. Empty means resolve ServiceName
@@ -49,6 +53,12 @@ type Config struct {
 	EnvironmentID string
 	Region        string
 	APIEndpoint   string
+
+	// Fly. The pool is every Machine in RunnerApp; the token must be able to
+	// start and stop them (`fly tokens create deploy -a <runner app>`).
+	FlyToken       string
+	FlyRunnerApp   string
+	FlyAPIEndpoint string
 
 	// Scaling
 	MinReplicas  int
@@ -68,8 +78,16 @@ const (
 	ScopeOrg  = "org"
 )
 
+// Backends, selected by RUNNER_BACKEND.
+const (
+	BackendRailway = "railway"
+	BackendFly     = "fly"
+)
+
 // Defaults applied when the corresponding variable is unset.
 const (
+	// DefaultBackend keeps existing Railway deployments working unchanged.
+	DefaultBackend    = BackendRailway
 	DefaultMaxRunners = 3
 	// DefaultMinReplicas is 0: idle costs nothing, at the price of a cold start
 	// on the first job. Raise it to keep a runner warm.
@@ -109,42 +127,27 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 
-	// Required.
-	for _, req := range []struct {
-		key string
-		dst *string
-	}{
-		{"GITHUB_WEBHOOK_SECRET", &cfg.WebhookSecret},
-		{"RAILWAY_API_TOKEN", &cfg.RailwayToken},
-		// Railway injects this automatically; the GraphQL mutation rejects an empty value.
-		{"RAILWAY_ENVIRONMENT_ID", &cfg.EnvironmentID},
-	} {
-		v := strings.TrimSpace(os.Getenv(req.key))
-		if v == "" {
-			return Config{}, fmt.Errorf("%s is required", req.key)
-		}
-		*req.dst = v
+	if err := require("GITHUB_WEBHOOK_SECRET", &cfg.WebhookSecret); err != nil {
+		return Config{}, err
 	}
 
-	// The runner service is addressed either by ID or by name. An explicit ID
-	// wins; otherwise the name is resolved against the project at startup, which
-	// needs the project ID Railway injects.
-	cfg.ServiceID = strings.TrimSpace(os.Getenv("RAILWAY_RUNNER_SERVICE_ID"))
-	cfg.ServiceName = strings.TrimSpace(os.Getenv("RAILWAY_RUNNER_SERVICE_NAME"))
-	cfg.ProjectID = strings.TrimSpace(os.Getenv("RAILWAY_PROJECT_ID"))
-	if cfg.ServiceID == "" {
-		if cfg.ServiceName == "" {
-			cfg.ServiceName = DefaultServiceName
-		}
-		if cfg.ProjectID == "" {
-			return Config{}, fmt.Errorf(
-				"RAILWAY_PROJECT_ID is required to resolve RAILWAY_RUNNER_SERVICE_NAME (%q); "+
-					"set RAILWAY_RUNNER_SERVICE_ID instead to skip the lookup", cfg.ServiceName)
-		}
+	cfg.Backend = strings.ToLower(strings.TrimSpace(os.Getenv("RUNNER_BACKEND")))
+	if cfg.Backend == "" {
+		cfg.Backend = DefaultBackend
 	}
-
-	// Optional. Empty means "discover from the service's current deployment".
-	cfg.Region = strings.TrimSpace(os.Getenv("RAILWAY_RUNNER_REGION"))
+	switch cfg.Backend {
+	case BackendRailway:
+		if err := loadRailway(&cfg); err != nil {
+			return Config{}, err
+		}
+	case BackendFly:
+		if err := loadFly(&cfg); err != nil {
+			return Config{}, err
+		}
+	default:
+		return Config{}, fmt.Errorf("RUNNER_BACKEND must be %q or %q, got %q",
+			BackendRailway, BackendFly, cfg.Backend)
+	}
 
 	// The scope decides how GITHUB_API_REPOSITORY is read, which is what lets a
 	// single variable feed both REPO_URL and ORG_NAME on the runner service.
@@ -187,12 +190,6 @@ func Load() (Config, error) {
 	cfg.GitHubAPIURL = strings.TrimSpace(os.Getenv("GITHUB_API_ENDPOINT"))
 	if cfg.GitHubAPIURL == "" {
 		cfg.GitHubAPIURL = github.DefaultEndpoint
-	}
-
-	// Overridable mainly for tests and proxies; defaults to Railway's public API.
-	cfg.APIEndpoint = strings.TrimSpace(os.Getenv("RAILWAY_API_URL"))
-	if cfg.APIEndpoint == "" {
-		cfg.APIEndpoint = railway.DefaultEndpoint
 	}
 
 	if err := envInt("MAX_RUNNERS", 1, &cfg.MaxRunners); err != nil {
@@ -239,6 +236,76 @@ func Load() (Config, error) {
 	}
 
 	return cfg, nil
+}
+
+// require reads a mandatory variable into dst.
+func require(key string, dst *string) error {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return fmt.Errorf("%s is required", key)
+	}
+	*dst = v
+	return nil
+}
+
+// loadRailway reads the variables the Railway backend needs.
+func loadRailway(cfg *Config) error {
+	if err := require("RAILWAY_API_TOKEN", &cfg.RailwayToken); err != nil {
+		return err
+	}
+	// Railway injects this automatically; the GraphQL mutation rejects an empty value.
+	if err := require("RAILWAY_ENVIRONMENT_ID", &cfg.EnvironmentID); err != nil {
+		return err
+	}
+
+	// The runner service is addressed either by ID or by name. An explicit ID
+	// wins; otherwise the name is resolved against the project at startup, which
+	// needs the project ID Railway injects.
+	cfg.ServiceID = strings.TrimSpace(os.Getenv("RAILWAY_RUNNER_SERVICE_ID"))
+	cfg.ServiceName = strings.TrimSpace(os.Getenv("RAILWAY_RUNNER_SERVICE_NAME"))
+	cfg.ProjectID = strings.TrimSpace(os.Getenv("RAILWAY_PROJECT_ID"))
+	if cfg.ServiceID == "" {
+		if cfg.ServiceName == "" {
+			cfg.ServiceName = DefaultServiceName
+		}
+		if cfg.ProjectID == "" {
+			return fmt.Errorf(
+				"RAILWAY_PROJECT_ID is required to resolve RAILWAY_RUNNER_SERVICE_NAME (%q); "+
+					"set RAILWAY_RUNNER_SERVICE_ID instead to skip the lookup", cfg.ServiceName)
+		}
+	}
+
+	// Optional. Empty means "discover from the service's current deployment".
+	cfg.Region = strings.TrimSpace(os.Getenv("RAILWAY_RUNNER_REGION"))
+
+	// Overridable mainly for tests and proxies; defaults to Railway's public API.
+	cfg.APIEndpoint = strings.TrimSpace(os.Getenv("RAILWAY_API_URL"))
+	if cfg.APIEndpoint == "" {
+		cfg.APIEndpoint = railway.DefaultEndpoint
+	}
+	return nil
+}
+
+// loadFly reads the variables the Fly backend needs.
+func loadFly(cfg *Config) error {
+	if err := require("FLY_API_TOKEN", &cfg.FlyToken); err != nil {
+		return err
+	}
+	if err := require("FLY_RUNNER_APP", &cfg.FlyRunnerApp); err != nil {
+		return err
+	}
+	// Fly injects FLY_APP_NAME into every Machine. Pointing the autoscaler at
+	// its own app would have it start and stop itself.
+	if self := strings.TrimSpace(os.Getenv("FLY_APP_NAME")); self != "" && self == cfg.FlyRunnerApp {
+		return fmt.Errorf("FLY_RUNNER_APP (%q) is the autoscaler's own app; "+
+			"the runners need an app of their own", cfg.FlyRunnerApp)
+	}
+
+	cfg.FlyAPIEndpoint = strings.TrimSpace(os.Getenv("FLY_API_URL"))
+	if cfg.FlyAPIEndpoint == "" {
+		cfg.FlyAPIEndpoint = fly.DefaultEndpoint
+	}
+	return nil
 }
 
 // ScalerOptions projects the config onto the scaler package's options.

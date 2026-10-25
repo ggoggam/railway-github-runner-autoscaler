@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ggoggam/railway-github-runner-autoscaler/internal/fly"
 	"github.com/ggoggam/railway-github-runner-autoscaler/internal/github"
 	"github.com/ggoggam/railway-github-runner-autoscaler/internal/railway"
 )
@@ -345,5 +346,74 @@ func TestLoadRejectsNameWithoutProjectID(t *testing.T) {
 
 	if _, err := Load(); err == nil {
 		t.Fatal("want error when neither RAILWAY_RUNNER_SERVICE_ID nor RAILWAY_PROJECT_ID is set")
+	}
+}
+
+// setFlyEnv sets the minimum viable Fly configuration, with no Railway variables.
+func setFlyEnv(t *testing.T) {
+	t.Helper()
+	t.Setenv("GITHUB_WEBHOOK_SECRET", "secret")
+	t.Setenv("RUNNER_BACKEND", "fly")
+	t.Setenv("FLY_API_TOKEN", "FlyV1 tok")
+	t.Setenv("FLY_RUNNER_APP", "runners")
+}
+
+func TestLoadDefaultsToRailwayBackend(t *testing.T) {
+	setRequiredEnv(t)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Backend != BackendRailway {
+		t.Errorf("Backend = %q, want %q", cfg.Backend, BackendRailway)
+	}
+}
+
+func TestLoadFlyBackend(t *testing.T) {
+	setFlyEnv(t)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Backend != BackendFly {
+		t.Errorf("Backend = %q, want %q", cfg.Backend, BackendFly)
+	}
+	if cfg.FlyToken != "FlyV1 tok" || cfg.FlyRunnerApp != "runners" {
+		t.Errorf("Fly settings = %q / %q", cfg.FlyToken, cfg.FlyRunnerApp)
+	}
+	if cfg.FlyAPIEndpoint != fly.DefaultEndpoint {
+		t.Errorf("FlyAPIEndpoint = %q, want %q", cfg.FlyAPIEndpoint, fly.DefaultEndpoint)
+	}
+}
+
+func TestLoadFlyRequiresEachSetting(t *testing.T) {
+	for _, missing := range []string{"FLY_API_TOKEN", "FLY_RUNNER_APP"} {
+		t.Run(missing, func(t *testing.T) {
+			setFlyEnv(t)
+			t.Setenv(missing, "")
+			if _, err := Load(); err == nil {
+				t.Fatalf("want error when %s is unset", missing)
+			}
+		})
+	}
+}
+
+func TestLoadFlyRejectsItsOwnApp(t *testing.T) {
+	setFlyEnv(t)
+	t.Setenv("FLY_APP_NAME", "runners")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("want error when FLY_RUNNER_APP is the autoscaler's own app")
+	}
+}
+
+func TestLoadRejectsUnknownBackend(t *testing.T) {
+	setRequiredEnv(t)
+	t.Setenv("RUNNER_BACKEND", "heroku")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("want error for an unknown RUNNER_BACKEND")
 	}
 }
