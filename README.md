@@ -158,6 +158,12 @@ GitHub ──workflow_job webhook──▶ autoscaler ──Machines API──�
   stops one GitHub reports as busy. If GitHub cannot be read, the scale-down waits.
 - **Idle cost** is the autoscaler Machine plus root-filesystem storage for the
   stopped runners. Nothing else runs while no jobs are queued.
+- **Docker works in jobs.** Each Machine is a VM, so `fly.runner.toml` sets
+  `START_DOCKER_SERVICE` and the image's own daemon starts before the runner;
+  testcontainers and `docker build` need nothing else. Docker can't keep its
+  layers on Fly's overlay root filesystem, so
+  [`fly.runner-entrypoint.sh`](fly.runner-entrypoint.sh) first mounts an ext4
+  file at `/var/lib/docker`; it shares the root filesystem's space.
 
 ### Setup
 
