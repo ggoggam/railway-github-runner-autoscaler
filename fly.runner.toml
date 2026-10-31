@@ -34,6 +34,21 @@ kill_timeout = "30s"
   # the autoscaler tells which Machines are mid-job and must not be stopped.
   RANDOM_RUNNER_SUFFIX = "false"
   RUNNER_NAME_PREFIX = "fly"
+  # Start the image's Docker daemon before the runner, so jobs can run containers
+  # (testcontainers, `docker build`). A Machine is a VM with its own kernel, so
+  # unlike a container runner this needs no privileged mode or mounted socket.
+  # See fly.runner-entrypoint.sh for where its data goes.
+  START_DOCKER_SERVICE = "true"
+
+# Docker's data dir has to be on a real filesystem, not Fly's overlay root; the
+# script mounts one and then runs the image's own entrypoint and command.
+[experimental]
+  entrypoint = ["/bin/bash", "/fly.runner-entrypoint.sh"]
+  cmd = ["./bin/Runner.Listener", "run", "--startuptype", "service"]
+
+[[files]]
+  guest_path = "/fly.runner-entrypoint.sh"
+  local_path = "fly.runner-entrypoint.sh"
 
 # An ephemeral runner exits 0 after every job. The Machine must then stay
 # stopped until the autoscaler starts it again; any restart policy would bring it
